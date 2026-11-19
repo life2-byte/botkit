@@ -1,52 +1,128 @@
-# botkit
+<div align="center">
 
-A chatbot/agent loop as a library. By default you get **only the loop** (model call, tool-call handling, retries,
-error handling). Everything else is a flag you switch on and wire where you like.
+# 🤖 botkit
+
+**A chatbot / AI agent loop in a few lines of Python.**
+Tools, skills, memory and MCP are optional. Switch on only what you need.
+
+![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Memory](https://img.shields.io/badge/memory-SQLite%20%7C%20Supabase%20%7C%20custom-orange)
+![Models](https://img.shields.io/badge/models-Groq%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20Gemini%20%7C%20Ollama-purple)
+
+</div>
+
+---
+
+## 📑 Table of Contents
+
+- [✨ Features](#-features)
+- [📦 Installation](#-installation)
+- [🚀 Quick Start](#-quick-start)
+- [🎛️ Flags](#️-flags)
+- [🛠️ Bundled Tools](#️-bundled-tools)
+- [🧠 Bundled Skills](#-bundled-skills)
+- [💾 Memory](#-memory)
+- [🔌 MCP](#-mcp)
+- [🔒 Rules & Security](#-rules--security)
+- [🌐 HTTP Server (optional)](#-http-server-optional)
+- [📁 Project Structure](#-project-structure)
+- [🗺️ Roadmap](#️-roadmap)
+- [🧪 Tests](#-tests)
+- [📄 License](#-license)
+
+---
+
+## ✨ Features
+
+- **Just the loop by default.** Model call, tool-call handling, retries and error recovery. Nothing else is switched on until you ask.
+- **12 bundled tools.** Files, Word / Excel / PowerPoint, web fetch and search, calculator, optional shell.
+- **10 bundled skills.** Research, planning, coding, debugging, writing and more. The model loads them only when needed.
+- **Memory on any database.** SQLite out of the box, Supabase, or your own backend by implementing one small class. Add your own tables too.
+- **MCP support.** Connect any MCP server (stdio, HTTP, SSE).
+- **You choose where commands run.** No shell, local shell, or a locked-down Docker container.
+- **Security enforced in code.** Workspace confinement, secret redaction, blocked internal URLs, and rules that can never loosen the security policy.
+- **Many providers.** Groq, OpenAI, OpenRouter, Gemini, Ollama, or any OpenAI-compatible server.
+
+## 📦 Installation
+
+```bash
+git clone https://github.com/YOUR-USERNAME/botkit.git
+cd botkit
+pip install -e .            # the loop only (needs just `openai`)
+pip install -e ".[docs]"    # + Word / Excel / PowerPoint tools
+pip install -e ".[mcp]"     # + MCP servers
+pip install -e ".[all]"     # everything
+```
+
+Or straight from GitHub, for example in a `requirements.txt`:
+
+```
+botkit[all] @ git+https://github.com/YOUR-USERNAME/botkit.git
+```
+
+Set your API key (or pass `api_key=` in code):
+
+```bash
+export GROQ_API_KEY="gsk_..."      # or OPENAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY (Ollama needs none)
+```
+
+Models are written as `"provider:model"`: `groq:`, `openai:`, `openrouter:`, `gemini:`, `ollama:` (no prefix means OpenAI). Any other OpenAI-compatible server works with `base_url=` and `api_key=`.
+
+## 🚀 Quick Start
+
+The smallest bot, just the loop:
 
 ```python
 from botkit import Agent
 
-bot = Agent("groq:openai/gpt-oss-120b")          # key from GROQ_API_KEY
-print(bot.chat("hello"))                          # or bot.run() for a terminal chat
-
-bot = Agent("groq:openai/gpt-oss-120b", tools=True, skills=True, memory="bot.db")   # now with everything
+bot = Agent("groq:openai/gpt-oss-120b")
+print(bot.chat("hello"))
+bot.run()                      # or a terminal chat
 ```
 
-## Install
+Everything switched on:
 
-```bash
-pip install -e .                 # the loop only (needs just `openai`)
-pip install -e ".[docs]"         # + Word/Excel/PowerPoint tools
-pip install -e ".[mcp]"          # + MCP servers
-pip install -e ".[all]"          # everything
-export GROQ_API_KEY=...          # or OPENAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY (Ollama needs none)
+```python
+from botkit import Agent
+
+bot = Agent(
+    "groq:openai/gpt-oss-120b",
+    tools=True,                # bundled tools
+    skills=True,               # bundled skills
+    memory="bot.db",           # SQLite memory
+)
+bot.run()
 ```
 
-Models are `"provider:model"`: `groq:`, `openai:`, `openrouter:`, `gemini:`, `ollama:` (no prefix = OpenAI).
-Other OpenAI-compatible servers: `base_url=` and `api_key=`.
+> Without `memory=`, the bot still remembers the conversation while the program runs. Memory adds saving across restarts plus long-term facts.
 
-## The flags
+## 🎛️ Flags
 
-| Flag | Default | What it switches on |
+| Flag | Default | What it does |
 |---|---|---|
-| `tools=` | none | `True` = all bundled tools · `["files", "web"]` groups · `["read_file"]` single tools · your own functions · any mix |
-| `skills=` | none | `True` = bundled skills · `"research"` one by name · `"my_skills/"` your folder · `Skill(...)` · any mix |
-| `memory=` | none (history in RAM only) | `"bot.db"` SQLite · `SupabaseStorage()` · your own `Storage` · `Memory(...)` |
-| `mcp=` | none | command string, URL, `MCP(...)`, list, or an `mcpServers` JSON file |
-| `shell=` | none | `"local"` or `"docker"` (or a dict / `Sandbox`). Turns on `run_command`. |
-| `rules=` | none | string, list, or a text file; added to the prompt |
+| `tools=` | off | `True` all bundled tools · `["files", "web"]` groups · `["read_file"]` single tools · your own functions · any mix |
+| `skills=` | off | `True` bundled skills · `"research"` one by name · `"my_skills/"` your own folder · any mix |
+| `memory=` | off | `"bot.db"` SQLite · `SupabaseStorage()` · your own `Storage` |
+| `mcp=` | off | command string, URL, `MCP(...)`, list, or an `mcpServers` JSON file |
+| `shell=` | off | `"local"` or `"docker"`. Turns on `run_command`. |
+| `rules=` | none | a string, a list, or a text file added to the prompt |
+| `workdir=` | `workspace/` | the only folder the file tools and shell can touch |
+| `session=` | `"default"` | one conversation per user inside the same memory |
 
-## Bundled tools (12): `botkit/tools/`
+## 🛠️ Bundled Tools
 
 | Group | Tools |
 |---|---|
-| `files` | `list_files` `read_file` (also reads .docx/.xlsx/.pptx) `write_file` `edit_file` `search_files` |
-| `docs` | `create_docx` `create_xlsx` `create_pptx` |
-| `web` | `fetch_url` `web_search` (DuckDuckGo; scraping a free page, may be rate-limited) |
-| `shell` | `run_command` (only with `shell=`) |
-| `util` | `calculate` (safe arithmetic) |
+| 📂 `files` | `list_files` · `read_file` (also reads .docx / .xlsx / .pptx) · `write_file` · `edit_file` · `search_files` |
+| 📄 `docs` | `create_docx` · `create_xlsx` · `create_pptx` |
+| 🌍 `web` | `fetch_url` · `web_search` (DuckDuckGo; it scrapes a free page and may be rate-limited) |
+| 💻 `shell` | `run_command` (only exists with `shell=`) |
+| 🧮 `util` | `calculate` (safe arithmetic, no `eval`) |
 
-Your own tool: `@tool` on a function. Type hints and the docstring become the schema.
+Files the bot creates are saved in the workspace folder (`workspace/` where you run the script). Change it with `workdir="D:/my_files"`.
+
+**Your own tool.** Put `@tool` on a function. Type hints and the docstring become the schema:
 
 ```python
 from botkit import Agent, tool
@@ -58,34 +134,37 @@ def order_status(order_id: str) -> str:
     Args:
         order_id: The order number.
     """
-    return "shipped"
+    return f"Order {order_id}: shipped"
 
-bot = Agent(tools=["files", "calculate", order_status])
+bot = Agent("groq:openai/gpt-oss-120b", tools=["files", "calculate", order_status])
 ```
 
-## Bundled skills (10): `botkit/skills/`
+## 🧠 Bundled Skills
 
-`research` · `planning` · `verify-work` · `writing-documents` · `presentations` · `spreadsheets` ·
-`data-analysis` · `coding` · `debugging` · `summarizing`
+`research` · `planning` · `verify-work` · `writing-documents` · `presentations` · `spreadsheets` · `data-analysis` · `coding` · `debugging` · `summarizing`
 
-Only each skill's name and one-line description go into the prompt; the model loads the full text with
-`load_skill` when a task matches. Your own skills are folders with a `SKILL.md`
-(frontmatter `name` and `description`, then the instructions): `Agent(skills=[True, "my_skills/"])`.
+Only each skill's name and one-line description go into the prompt. The model calls `load_skill` to read the full instructions when a task matches, so many skills cost almost no context.
 
-## Memory: choose the database
-
-Memory is history (survives restarts) plus long-term facts (`remember` / `recall` / `forget` tools).
-It sits on a `Storage` backend, so the database is your choice:
+**Your own skills** are folders with a `SKILL.md` (frontmatter `name` and `description`, then the instructions):
 
 ```python
-Agent(memory="bot.db")                              # SQLite (zero setup)
-Agent(memory=SupabaseStorage())                     # Supabase
-Agent(memory=MyStorage())                           # anything you write (see below)
-Agent(memory="bot.db", session="user42")            # one session per user, same database
+Agent(model, skills=[True, "my_skills/"])    # bundled + yours
 ```
 
-**Supabase.** Run once in the Supabase SQL editor (`python -m botkit.memory.supabase` prints it), then set
-`SUPABASE_URL` and `SUPABASE_KEY` (the `service_role` key, server side only):
+## 💾 Memory
+
+Memory stores the conversation (survives restarts) and long-term facts (`remember` / `recall` / `forget` tools). It runs on a `Storage` backend, so the database is your choice.
+
+```python
+Agent(model, memory="bot.db")                    # SQLite (zero setup)
+Agent(model, memory=SupabaseStorage())           # Supabase
+Agent(model, memory=MyStorage())                 # anything you write
+Agent(model, memory="bot.db", session="user42")  # one session per user
+```
+
+### Supabase
+
+Run this once in the Supabase SQL editor (or print it with `python -m botkit.memory.supabase`):
 
 ```sql
 create table if not exists botkit_messages (
@@ -100,60 +179,126 @@ alter table botkit_messages enable row level security;
 alter table botkit_facts enable row level security;
 ```
 
-**Your own tables** (same connection):
+Then connect (use the **service_role** key, server side only, never in a browser or app):
 
 ```python
-db = SQLiteStorage("bot.db", extra_schema="CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, item TEXT)")
-db.execute("INSERT INTO orders(item) VALUES(?)", ("tea",));  db.query("SELECT * FROM orders")
+import os
+from botkit import Agent, SupabaseStorage
 
-store = SupabaseStorage()
-store.table("orders").insert({"item": "tea"});  store.table("orders").select({"item": "tea"}, order="id.desc")
+store = SupabaseStorage(url="https://YOUR-PROJECT.supabase.co", key=os.environ["SUPABASE_KEY"])
+bot = Agent("groq:openai/gpt-oss-120b", memory=store, session="ahmed")
 ```
 
-Wrap those calls in `@tool` functions to let the bot use them (`examples/memory_backends.py`).
+### Your own tables
 
-**Any other database:** subclass `Storage` and implement 6 methods (`add_messages`, `get_messages`,
-`clear_messages`, `add_fact`, `list_facts`, `delete_fact`). `examples/custom_storage.py` is a complete template.
+```python
+from botkit import SQLiteStorage, SupabaseStorage
 
-## Rules and security
+db = SQLiteStorage("bot.db", extra_schema="CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, item TEXT)")
+db.execute("INSERT INTO orders(item) VALUES(?)", ("tea",))
+db.query("SELECT * FROM orders")
 
-`rules=["Reply in Urdu"]` adds your rules to the prompt; the security rules always come last and cannot be loosened.
-Enforcement is in code, not in the prompt:
+store = SupabaseStorage()
+store.table("orders").insert({"item": "tea"})
+store.table("orders").select({"item": "tea"}, order="id.desc", limit=5)
+```
 
-- File tools and the shell are confined to the workspace folder (`..`, absolute paths and symlinks are refused).
-- The shell does not exist unless you choose an environment: `"local"` (workspace only, API keys hidden, dangerous
-  commands blocked; a speed bump, not a jail) or `"docker"` (throwaway container: no network, read-only root,
-  memory/CPU limits). `deny=[r"git push"]` blocks more commands, `approve=callback` asks you before each command.
-- API keys and tokens are redacted from anything a tool returns to the model.
-- `fetch_url` and `web_search` refuse private/internal addresses, also after redirects.
-- Tool output and web pages are marked as untrusted data (prompt-injection defence).
+Wrap these calls in `@tool` functions to let the bot use them. See `examples/memory_backends.py`.
 
-## Layout
+### Any other database
+
+Subclass `Storage` and implement six methods: `add_messages`, `get_messages`, `clear_messages`, `add_fact`, `list_facts`, `delete_fact`. A complete template is in `examples/custom_storage.py`.
+
+## 🔌 MCP
+
+```python
+Agent(model, mcp="npx -y @modelcontextprotocol/server-filesystem .")     # local server
+Agent(model, mcp="https://example.com/mcp")                              # remote server
+Agent(model, mcp="mcp.json")                                             # Claude-Desktop style config
+```
+
+Requires `pip install -e ".[mcp]"`. A server that fails to start is skipped with a warning instead of crashing the bot.
+
+## 🔒 Rules & Security
+
+```python
+Agent(model, rules=["Reply in Urdu", "Never discuss pricing"])     # or rules="rules.txt"
+Agent(model, shell="docker", deny=[r"git push", r"pip install"])   # extra blocked commands
+Agent(model, shell="local", approve=lambda name, args: input(f"Run {args['command']}? ") == "y")
+```
+
+Your rules go into the prompt, but the security rules always come last and cannot be loosened. The real enforcement is in code, not in the prompt:
+
+- 📁 File tools and the shell are confined to the workspace folder (`..`, absolute paths and symlinks are refused).
+- 💻 There is **no shell** unless you choose one in code: `"local"` (workspace only, API keys hidden from commands, dangerous commands blocked; a speed bump, not a jail) or `"docker"` (throwaway container: no network, read-only root, memory and CPU limits). Use Docker for anyone you do not fully trust.
+- 🔑 API keys and tokens are redacted from anything a tool returns to the model.
+- 🌐 `fetch_url` and `web_search` refuse private and internal addresses, including after redirects.
+- 🧱 Tool output and web pages are marked as untrusted data (prompt-injection defence).
+- ♻️ Tool errors, bad JSON, timeouts and repeated calls are fed back to the model so it can recover. API errors (429, 5xx) are retried with backoff.
+
+## 🌐 HTTP Server (optional)
+
+Expose the bot to a website or mobile app:
+
+```python
+bot.serve(host="0.0.0.0", port=8000, token="change-me", cors_origins=["https://myapp.com"])
+```
+
+```
+POST /chat   {"message": "make a budget sheet", "session": "user42"}
+GET  /files/<session>/<path>      download a file the bot created
+GET  /health
+```
+
+Each `session` is a separate user with its own history, facts and workspace folder. Listening on a public address without a `token` is refused.
+
+## 📁 Project Structure
 
 ```
 botkit/
-  pyproject.toml  README.md
-  botkit/
-    agent.py        the loop (Agent)
-    llm.py          model client, retries
-    tool.py         @tool, Tool
-    skill.py        skill loader
-    mcp.py          MCP bridge
-    security.py  sandbox.py  errors.py
-    server.py       optional HTTP API: Agent(...).serve()
-    memory/         Storage base, SQLite, Supabase, Memory
-    tools/          files.py docs.py web.py shell.py util.py
-    skills/         10 folders, each with a SKILL.md
-  examples/  tests/
+├── pyproject.toml
+├── README.md
+├── botkit/
+│   ├── agent.py          # the loop (Agent)
+│   ├── llm.py            # model client, retries
+│   ├── tool.py           # @tool, Tool
+│   ├── skill.py          # skill loader
+│   ├── mcp.py            # MCP bridge
+│   ├── security.py       # policy: workspace, commands, secrets
+│   ├── sandbox.py        # local and Docker shell
+│   ├── server.py         # optional HTTP API
+│   ├── memory/           # Storage base, SQLite, Supabase, Memory
+│   ├── tools/            # files.py docs.py web.py shell.py util.py
+│   └── skills/           # 10 folders, each with a SKILL.md
+├── examples/
+└── tests/
 ```
 
-## Not included (yet)
+## 🗺️ Roadmap
 
-Streaming replies, async API, token-based context trimming (history is trimmed by message count),
-sub-agents, image input, scheduled tasks.
+- [ ] Streaming replies
+- [ ] Async API (`await bot.achat(...)`)
+- [ ] Token-based context trimming (history is trimmed by message count today)
+- [ ] `create_pdf` tool
+- [ ] File storage backends (S3, Supabase Storage) like the memory backends
+- [ ] Sub-agents
+- [ ] Image input
 
-## Tests
+## 🧪 Tests
 
 ```bash
-pip install -e ".[dev]" && pytest
+pip install -e ".[dev]"
+pytest
 ```
+
+## 📄 License
+
+MIT. See the `LICENSE` file.
+
+---
+
+<div align="center">
+
+Built by **Ahmed** · If this helped you, give it a ⭐
+
+</div>
