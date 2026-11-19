@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botkit"
+version = "0.3.0"
+description = "A chatbot/agent loop in a few lines, with optional tools, skills, memory (SQLite/Supabase/your own) and MCP."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["openai>=1.40"]
+
+[project.optional-dependencies]
+docs = ["python-docx", "python-pptx", "openpyxl"]
+mcp = ["mcp>=1.2"]
+all = ["python-docx", "python-pptx", "openpyxl", "mcp>=1.2"]
+dev = ["pytest", "python-docx", "python-pptx", "openpyxl", "mcp>=1.2"]
+
+[tool.setuptools.packages.find]
+include = ["botkit*"]
+
+[tool.setuptools.package-data]
+botkit = ["skills/*/SKILL.md"]
