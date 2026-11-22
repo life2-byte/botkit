@@ -1,30 +1,37 @@
 """The Agent: the chat loop. Tools, skills, memory and MCP plug into it through flags."""
 from __future__ import annotations
 
+import asyncio
 import atexit
+import concurrent.futures
 import dataclasses
 import json
+import queue
 import re
 import sys
 import threading
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .chatio import ChatMixin
 from .errors import BotError, LLMError
 from .llm import LLM
 from .mcp import MCP, normalize
-from .memory import Memory, SQLiteStorage, Storage, trim_history
+from .memory import Memory, SQLiteStorage, Storage, compact_history, trim_history, trim_to_tokens
 from .sandbox import DockerSandbox, make_sandbox
 from .security import Policy
 from .skill import SkillBook, resolve_skills
 from .tool import Tool, as_tool, to_text
-from .tools import build as build_bundled
+from .tools import CATEGORY_LABELS, build as build_bundled, category_of
+from .trace import Trace, log
 
 DEFAULT_SYSTEM = "You are a helpful assistant. Be concise and accurate. Use your tools when they help."
 DEFAULT_MODEL = "groq:openai/gpt-oss-120b"
 _MAX_SAME_CALL = 2
+_DONE = object()
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 SECURITY_PROMPT = (
@@ -74,7 +81,7 @@ def _load_rules(rules: Any) -> list[str]:
     return [str(r).strip() for r in rules if str(r).strip()]
 
 
-class Agent:
+class Agent(ChatMixin):
     """The chat loop, with everything else optional.
 
         bot = Agent("groq:openai/gpt-oss-120b")          # just the loop (history in RAM)
@@ -112,6 +119,12 @@ class Agent:
         max_tool_output: tool results longer than this are truncated.
         tool_timeout: seconds before a tool call is abandoned (None = run inline, no timeout).
         llm: bring your own object with `.chat(messages, tools) -> assistant message dict`.
+        max_context_tokens: estimated token budget for OLD turns sent to the model (None = only max_history applies).
+            Old tool outputs are shortened, then the oldest turns are dropped. The current turn is always sent in full.
+        parallel_tools: run several tool calls from one model reply at the same time (never for the shell).
+        name / description: how this agent is called inside a multi-agent graph.
+        trace: True (or a Trace object) records every model call, tool call and error in `bot.trace`.
+        llm: bring your own object with `.chat(messages, tools)`; add `.stream(...)` to support streaming.
         verbose / on_event: watch tool calls.
     """
 
@@ -119,6 +132,8 @@ class Agent:
         self,
         model: str = DEFAULT_MODEL,
         *,
+        name: str = "agent",
+        description: str = "",
         system: str = DEFAULT_SYSTEM,
         tools: Any = None,
         skills: Any = None,
@@ -135,6 +150,9 @@ class Agent:
         max_history: int = 40,
         max_tool_output: int = 8000,
         tool_timeout: float | None = 60.0,
+        max_context_tokens: int | None = 24000,
+        parallel_tools: bool = True,
+        trace: Trace | bool | None = None,
         temperature: float = 0.3,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -143,7 +161,14 @@ class Agent:
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
         self._init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
+        self.name = name
+        self.description = description
         self.system = system
+        self.max_context_tokens = max_context_tokens
+        self.parallel_tools = parallel_tools
+        self.trace: Trace | None = trace if isinstance(trace, Trace) else (Trace() if trace else None)
+        self._seen_lock = threading.Lock()
+        self.tool_calls = 0  # how many tool calls this agent has run (graphs use it to tell real progress from repetition)
         self.max_steps = max_steps
         self.max_history = max_history
         self.max_tool_output = max_tool_output
@@ -180,6 +205,7 @@ class Agent:
             names.append("shell")  # choosing a shell environment turns on run_command
         for t in build_bundled(self.policy, self.sandbox, True if everything else names):
             self.add_tool(t)
+        self._bundled = set(self._tools)
 
         # memory flag
         self.memory: Memory | None = self._resolve_memory(memory, session, max_history)
@@ -233,9 +259,10 @@ class Agent:
         self._start_mcp()
         return list(self._tools)
 
-    def chat(self, user_input: str) -> str:
+    def chat(self, user_input: str, on_token: Callable[[str], None] | None = None) -> str:
         """Run one user turn: call the model, run any tools it asks for, repeat, return the final text.
 
+        `on_token(text)` is called with each piece of text while the model writes it (streaming).
         Raises LLMError if the model API keeps failing. If a turn fails, the conversation is rolled
         back to its state before the turn, so you can simply try again.
         """
@@ -244,46 +271,43 @@ class Agent:
             start = len(self.messages)
             self.messages.append({"role": "user", "content": user_input})
             try:
-                answer = self._run_turn(start)
-            except BaseException:
+                answer = self._run_turn(start, on_token)
+            except BaseException as e:
                 del self.messages[start:]
+                self._emit("error", error=f"{type(e).__name__}: {e}")
                 raise
             if self.memory:
                 self.memory.extend(self.messages[start:])
             return answer
 
-    def run(self, prompt: str = "You: ") -> None:
-        """Interactive terminal chat. Type 'exit' to quit, '/clear' to forget this conversation."""
-        print("Chat started. Type 'exit' to quit, '/clear' to reset.")
-        while True:
-            try:
-                text = input(prompt).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not text:
-                continue
-            if text.lower() in ("exit", "quit", "/exit", "/quit"):
-                break
-            if text == "/clear":
-                self.reset()
-                print("(conversation cleared)")
-                continue
-            try:
-                print(f"Bot: {self.chat(text)}")
-            except KeyboardInterrupt:
-                print("\n(interrupted)")
-            except BotError as e:
-                print(f"[error] {e}")
-            except Exception as e:  # noqa: BLE001 - keep the REPL alive
-                print(f"[error] {type(e).__name__}: {e}")
-        self.close()
+    def __or__(self, other: Any) -> Any:
+        """planner | worker | reviewer  ->  a sequential Graph (see botkit.graph.chain)."""
+        from .graph import chain
 
-    def serve(self, host: str = "127.0.0.1", port: int = 8000, **options: Any) -> Any:
-        """Expose this bot as an HTTP API for a web/mobile UI (see botkit.server.serve for options)."""
-        from .server import serve
+        return chain(self, other)
 
-        return serve(self, host=host, port=port, **options)
+    def ask(self, prompt: str, on_token: Callable[[str], None] | None = None) -> str:
+        """One-shot task with a clean slate: nothing is read from or written to this agent's history.
+        This is what graph nodes use, so an agent can be visited many times without its context growing."""
+        with self._lock:
+            self._start_mcp()
+            saved, self.messages = self.messages, [{"role": "user", "content": prompt}]
+            try:
+                return self._run_turn(0, on_token)
+            except BaseException as e:
+                self._emit("error", error=f"{type(e).__name__}: {e}")
+                raise
+            finally:
+                self.messages = saved
+
+    def tools_info(self) -> list[dict]:
+        """What this agent can do: [{'name', 'description', 'source'}] with source = bundled | mcp | custom."""
+        self._start_mcp()
+        out = []
+        for t in self._tools.values():
+            src = "mcp" if t.name in self._mcp_tools else ("bundled" if t.name in self._bundled else "custom")
+            out.append({"name": t.name, "description": t.description, "source": src, "category": category_of(t.name)})
+        return out
 
     def fork(self, session: str) -> "Agent":
         """A copy of this bot for another user: own history, own facts, own workspace sub-folder.
@@ -294,6 +318,7 @@ class Agent:
         kwargs = dict(self._init_kwargs)
         kwargs.update(
             session=session,
+            trace=self.trace,
             mcp=None,
             llm=self.llm,
             memory=self.memory.for_session(session) if self.memory else None,
@@ -323,12 +348,6 @@ class Agent:
             except Exception:  # noqa: BLE001
                 pass
 
-    def __enter__(self) -> "Agent":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
-
     # ---- internals ------------------------------------------------------------
     def _start_mcp(self) -> None:
         if self._mcp_started:
@@ -346,6 +365,14 @@ class Agent:
 
     def _system_prompt(self) -> str:
         parts = [self.system, f"Current date: {datetime.now().astimezone():%A, %d %B %Y}."]
+        if not self._tools:  # some models try to call tools they were never given, which providers reject
+            parts.append("You have no tools. Never try to call a tool; answer in plain text only.")
+        if self._tools:
+            groups: dict[str, list[str]] = {}
+            for name in self._tools:
+                groups.setdefault(category_of(name), []).append(name)
+            lines = [f"- {CATEGORY_LABELS[c]}: {', '.join(groups[c])}" for c in CATEGORY_LABELS if c in groups]
+            parts.append("Your tools, by purpose (pick the right kind for the job):\n" + "\n".join(lines))
         if "write_file" in self._tools or "create_docx" in self._tools:
             parts.append("Files you create go in your workspace folder; tell the user the file name when you make one.")
         if self.skills:
@@ -364,15 +391,27 @@ class Agent:
 
     def _view(self, start: int, extra: list[dict] | None = None) -> list[dict]:
         # Only older turns are trimmed; the current turn is always sent in full.
-        history = trim_history(self.messages[:start], self.max_history)
+        history = compact_history(trim_history(self.messages[:start], self.max_history))
+        history = trim_to_tokens(history, self.max_context_tokens)
         return [{"role": "system", "content": self._system_prompt()}, *history, *self.messages[start:], *(extra or [])]
 
     def _emit(self, kind: str, **data: Any) -> None:
+        data.setdefault("agent", self.name)
+        if self.trace is not None:
+            self.trace.add(kind, **data)
+        if kind == "error":
+            log.warning("[%s] %s", self.name, data.get("error"))
+        elif kind == "tool_call":
+            log.info("[%s] tool %s %s", self.name, data.get("name"), json.dumps(data.get("args"), ensure_ascii=False)[:200])
+        else:
+            log.debug("[%s] %s %s", self.name, kind, {k: v for k, v in data.items() if k not in ("result", "args")})
         if self.verbose:
             if kind == "tool_call":
                 print(f"  [tool] {data['name']}({json.dumps(data['args'], ensure_ascii=False)[:200]})", file=sys.stderr)
             elif kind == "tool_result":
                 print(f"  [result] {data['result'][:200]}", file=sys.stderr)
+            elif kind == "llm_call":
+                print(f"  [model] {data['seconds']:.1f}s", file=sys.stderr)
             else:
                 print(f"  [{kind}]", file=sys.stderr)
         if self.on_event:
@@ -381,29 +420,53 @@ class Agent:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _run_turn(self, start: int) -> str:
+    def _call_llm(self, messages: list[dict], specs: list[dict] | None, on_token: Callable[[str], None] | None) -> dict:
+        usage = getattr(self.llm, "usage", None)
+        before = dict(usage) if isinstance(usage, dict) else None
+        t0 = time.monotonic()
+        if on_token is not None and hasattr(self.llm, "stream"):
+            reply = self.llm.stream(messages, specs, on_token)
+        else:
+            reply = self.llm.chat(messages, specs)
+        info: dict[str, Any] = {"seconds": round(time.monotonic() - t0, 3), "messages": len(messages)}
+        if before is not None:
+            info["prompt_tokens"] = usage["prompt_tokens"] - before["prompt_tokens"]
+            info["completion_tokens"] = usage["completion_tokens"] - before["completion_tokens"]
+        self._emit("llm_call", **info)
+        return reply
+
+    def _run_turn(self, start: int, on_token: Callable[[str], None] | None = None) -> str:
         specs = [t.spec() for t in self._tools.values()]
         seen: dict[tuple[str, str], int] = {}
         for _ in range(self.max_steps):
-            reply = self.llm.chat(self._view(start), specs or None)
+            reply = self._call_llm(self._view(start), specs or None, on_token)
             self.messages.append(reply)
             calls = reply.get("tool_calls") or []
             if not calls:
                 return (reply.get("content") or "").strip() or "(no response)"
-            for call in calls:
-                result = self._exec(call, seen)
+            for call, result in zip(calls, self._exec_all(calls, seen)):
                 self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
         # Step limit: ask for a final answer without tools instead of failing.
         self._emit("step_limit", max_steps=self.max_steps)
         nudge = {"role": "user", "content": "[system] Tool-step limit reached. Answer now using what you have."}
         try:
-            final = (self.llm.chat(self._view(start, [nudge]), None).get("content") or "").strip()
+            final = (self._call_llm(self._view(start, [nudge]), None, on_token).get("content") or "").strip()
         except LLMError:
             final = ""
         final = final or f"I couldn't finish within {self.max_steps} steps. Please try a simpler request."
         self.messages.append({"role": "assistant", "content": final})
         return final
+
+    def _exec_all(self, calls: list[dict], seen: dict[tuple[str, str], int]) -> list[str]:
+        """Run the tool calls of one model reply. Several independent calls run at the same time;
+        anything sensitive (the shell) or a single call runs inline, in order."""
+        names = [c.get("function", {}).get("name", "") for c in calls]
+        risky = any((t := self._tools.get(n)) is not None and t.sensitive for n in names)
+        if len(calls) < 2 or not self.parallel_tools or risky:
+            return [self._exec(c, seen) for c in calls]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(calls), 8)) as pool:
+            return list(pool.map(lambda c: self._exec(c, seen), calls))
 
     def _exec(self, call: dict, seen: dict[tuple[str, str], int]) -> str:
         fn = call.get("function", {})
@@ -420,8 +483,10 @@ class Agent:
             return f"Error: invalid arguments for '{name}' ({e}). Send a valid JSON object."
 
         key = (name, json.dumps(args, sort_keys=True, default=str))
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] > _MAX_SAME_CALL:
+        with self._seen_lock:
+            seen[key] = seen.get(key, 0) + 1
+            repeated = seen[key] > _MAX_SAME_CALL
+        if repeated:
             return (
                 f"Error: you already called '{name}' with these exact arguments {_MAX_SAME_CALL} times. "
                 "Try a different approach or answer the user."
@@ -435,7 +500,10 @@ class Agent:
             if not allowed:
                 return f"Error: the owner denied this '{name}' call. Do not retry it."
 
+        with self._seen_lock:
+            self.tool_calls += 1
         self._emit("tool_call", name=name, args=args)
+        t0 = time.monotonic()
         try:
             text = to_text(_call_with_timeout(lambda: tool.run(args), self.tool_timeout))
         except _ToolTimeout:
@@ -445,5 +513,5 @@ class Agent:
         text = self.policy.redact(text)
         if len(text) > self.max_tool_output:
             text = text[: self.max_tool_output] + f"\n...[truncated {len(text) - self.max_tool_output} characters]"
-        self._emit("tool_result", name=name, result=text)
+        self._emit("tool_result", name=name, result=text, seconds=round(time.monotonic() - t0, 3))
         return text

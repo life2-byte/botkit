@@ -15,3 +15,12 @@ __pycache__/
 workspace/
 *.db
 
+
+*.egg-info/
+dist/
+build/
+venv/
+__pycache__/
+workspace/
+ws_test/
+*.db

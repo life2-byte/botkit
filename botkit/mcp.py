@@ -77,6 +77,7 @@ class MCP:
         self._runner: concurrent.futures.Future | None = None
         self._ready: concurrent.futures.Future | None = None
         self._stop: asyncio.Event | None = None
+        self._start_lock = threading.RLock()
 
     @classmethod
     def from_config(cls, name: str, cfg: dict) -> "MCP":
@@ -88,6 +89,10 @@ class MCP:
 
     # ---- lifecycle ------------------------------------------------------------
     def start(self) -> None:
+        with self._start_lock:  # several agents may share one server and start it at the same moment
+            self._start()
+
+    def _start(self) -> None:
         if self._session is not None:
             return
         try:

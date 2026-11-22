@@ -175,6 +175,7 @@ def test_supabase_custom_tables(fake):
 def test_supabase_schema_sql():
     sql = SupabaseStorage.schema_sql()
     assert "botkit_messages" in sql and "botkit_facts" in sql and "jsonb" in sql and "enable row level security" in sql
+    assert "grant all on table public.botkit_messages to service_role" in sql and "grant usage on schema public" in sql
     assert "app_messages" in SupabaseStorage.schema_sql("app_")
     with pytest.raises(ValueError):
         SupabaseStorage.schema_sql("x;--")

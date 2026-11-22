@@ -1,4 +1,4 @@
-"""File tools (5): list_files, read_file, write_file, edit_file, search_files. Confined to the workspace."""
+"""File tools (7): list_files, read_file, write_file, edit_file, search_files, tree, file_info. Confined to the workspace."""
 from __future__ import annotations
 
 import fnmatch
@@ -27,12 +27,14 @@ def make(policy: Policy, sandbox=None) -> list[Tool]:
         return "\n".join(lines) or "(empty)"
 
     @tool
-    def read_file(path: str, max_chars: int = 20000) -> str:
-        """Read a file from the workspace. Works for text files and .docx/.xlsx/.pptx documents.
+    def read_file(path: str, max_chars: int = 20000, start: int = 1, lines: int = 0) -> str:
+        """Read a file from the workspace (text files and .docx/.xlsx/.pptx). For big files read a slice: set start and lines instead of reading everything.
 
         Args:
             path: File path relative to the workspace.
             max_chars: Maximum characters to return.
+            start: First line to return (1 = the beginning).
+            lines: How many lines to return from start (0 = everything, up to max_chars). With lines set, each line is numbered.
         """
         p = policy.resolve(path)
         if not p.is_file():
@@ -40,11 +42,21 @@ def make(policy: Policy, sandbox=None) -> list[Tool]:
         if p.stat().st_size > policy.max_file_bytes:
             raise ValueError("file is too large to read")
         if p.suffix.lower() in OFFICE_EXT:
-            return clip(read_office(p), max_chars)
-        raw = p.read_bytes()
-        if b"\0" in raw[:2048]:
-            return f"[binary file, {len(raw)} bytes]"
-        return clip(raw.decode("utf-8", errors="replace"), max_chars)
+            text = read_office(p)
+        else:
+            raw = p.read_bytes()
+            if b"\0" in raw[:2048]:
+                return f"[binary file, {len(raw)} bytes]"
+            text = raw.decode("utf-8", errors="replace")
+        if start > 1 or lines > 0:
+            all_lines = text.splitlines()
+            total, first = len(all_lines), max(int(start), 1)
+            last = total if lines <= 0 else min(total, first + int(lines) - 1)
+            body = "\n".join(f"{i}: {line}" for i, line in enumerate(all_lines[first - 1 : last], first))
+            return clip(f"[lines {first}-{last} of {total}]\n{body}", max_chars)
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n...[truncated {len(text) - max_chars} characters; use start/lines to read the rest]"
+        return text
 
     @tool
     def write_file(path: str, content: str) -> str:
@@ -122,4 +134,66 @@ def make(policy: Policy, sandbox=None) -> list[Tool]:
                         return "\n".join(hits) + f"\n[stopped after {max_results} matches]"
         return "\n".join(hits) or "No matches."
 
-    return [list_files, read_file, write_file, edit_file, search_files]
+    @tool
+    def tree(path: str = ".", depth: int = 3) -> str:
+        """Show the folder structure of the workspace as a tree (quick way to see what exists).
+
+        Args:
+            path: Folder relative to the workspace.
+            depth: How many levels to show (1-6).
+        """
+        root = policy.resolve(path)
+        if not root.is_dir():
+            raise NotADirectoryError(f"'{path}' is not a folder")
+        depth = min(max(int(depth), 1), 6)
+        out: list[str] = [f"{path.rstrip('/') or '.'}/"]
+
+        def walk(folder: Path, prefix: str, level: int) -> None:
+            entries = sorted(
+                (e for e in folder.iterdir() if not e.name.startswith(".")),
+                key=lambda e: (not e.is_dir(), e.name.lower()),
+            )
+            for i, e in enumerate(entries):
+                if len(out) >= 300:
+                    return
+                last = i == len(entries) - 1
+                mark = "`-- " if last else "|-- "
+                if e.is_symlink():
+                    out.append(f"{prefix}{mark}{e.name}@")
+                elif e.is_dir():
+                    out.append(f"{prefix}{mark}{e.name}/")
+                    if level < depth:
+                        walk(e, prefix + ("    " if last else "|   "), level + 1)
+                else:
+                    out.append(f"{prefix}{mark}{e.name} ({e.stat().st_size} bytes)")
+
+        walk(root, "", 1)
+        if len(out) >= 300:
+            out.append("[tree cut at 300 entries]")
+        return "\n".join(out)
+
+    @tool
+    def file_info(path: str) -> str:
+        """Quick facts about a file or folder (type, size, lines, last change) without reading it all.
+
+        Args:
+            path: Path relative to the workspace.
+        """
+        import time
+
+        p = policy.resolve(path)
+        if not p.exists():
+            raise FileNotFoundError(f"no such file or folder: {path}")
+        st = p.stat()
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+        if p.is_dir():
+            return f"{path}: folder, {sum(1 for _ in p.iterdir())} entries, changed {when}"
+        info = f"{path}: file, {st.st_size} bytes, type {p.suffix.lower() or 'none'}, changed {when}"
+        if p.suffix.lower() not in OFFICE_EXT and st.st_size <= policy.max_file_bytes:
+            raw = p.read_bytes()
+            if b"\0" not in raw[:2048]:
+                n_lines = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
+                info += f", {n_lines} lines"
+        return info
+
+    return [list_files, read_file, write_file, edit_file, search_files, tree, file_info]

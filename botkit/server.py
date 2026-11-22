@@ -2,7 +2,10 @@
 
     POST /chat    {"message": "...", "session": "user42"}  ->  {"reply": "...", "files": [{"name", "url"}]}
     GET  /files/<session>/<path>                           ->  download a file the bot created
-    GET  /health
+    GET  /health                                           ->  {"ok": true, "version": "..."}
+
+Settings can come from the environment (handy in Docker): BOTKIT_HOST, PORT (or BOTKIT_PORT), BOTKIT_TOKEN,
+BOTKIT_CORS (comma separated origins). Arguments you pass in code win over the environment.
 
 Each `session` is an independent user: own history, own workspace folder. Set `token=` and send
 `Authorization: Bearer <token>` (file downloads also accept `?token=`). Listening on anything other than
@@ -23,7 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from .errors import BotError, LLMError
+from . import __version__
+from .errors import BotError
 
 _SESSION = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_BODY = 1_000_000
@@ -108,7 +112,7 @@ def _make_handler(sessions: _Sessions, token: str | None, cors_origins: list[str
             url = urlparse(self.path)
             query = parse_qs(url.query)
             if url.path == "/health":
-                return self._json(200, {"ok": True})
+                return self._json(200, {"ok": True, "version": __version__})
             if not self._authed(query):
                 return self._json(401, {"error": "unauthorized"})
             m = re.fullmatch(r"/files/([^/]+)/(.+)", url.path)
@@ -157,7 +161,7 @@ def _make_handler(sessions: _Sessions, token: str | None, cors_origins: list[str
             before = _snapshot(root)
             try:
                 reply = agent.chat(message)
-            except LLMError as e:
+            except BotError as e:  # model/workflow problems carry a safe, readable message
                 return self._json(502, {"error": str(e)})
             except Exception as e:  # noqa: BLE001 - never leak internals to the client
                 print(f"botkit server error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -172,8 +176,8 @@ def _make_handler(sessions: _Sessions, token: str | None, cors_origins: list[str
 
 def serve(
     agent: Any,
-    host: str = "127.0.0.1",
-    port: int = 8000,
+    host: str | None = None,
+    port: int | None = None,
     token: str | None = None,
     cors_origins: list[str] | None = None,
     max_sessions: int = 200,
@@ -181,6 +185,11 @@ def serve(
 ) -> ThreadingHTTPServer:
     """Start the HTTP API. With block=False the server runs in a background thread and is returned
     (call .shutdown() to stop it)."""
+    host = host or os.environ.get("BOTKIT_HOST", "127.0.0.1")
+    port = port if port is not None else int(os.environ.get("PORT") or os.environ.get("BOTKIT_PORT") or 8000)
+    token = token if token is not None else (os.environ.get("BOTKIT_TOKEN") or None)
+    if cors_origins is None and os.environ.get("BOTKIT_CORS"):
+        cors_origins = [o.strip() for o in os.environ["BOTKIT_CORS"].split(",") if o.strip()]
     if token is None and host not in _LOCAL:
         raise BotError("Refusing to listen on a non-local address without token=... (anyone could use your bot).")
     httpd = ThreadingHTTPServer((host, port), _make_handler(_Sessions(agent, max_sessions), token, cors_origins))
@@ -189,6 +198,10 @@ def serve(
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         return httpd
     print(f"botkit listening on http://{host}:{httpd.server_address[1]}  (POST /chat)")
+    if threading.current_thread() is threading.main_thread():  # docker stop sends SIGTERM: shut down cleanly
+        import signal
+
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

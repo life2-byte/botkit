@@ -1,6 +1,6 @@
 """Supabase storage over its REST API (PostgREST). No extra packages needed.
 
-1. In Supabase: SQL Editor -> run the output of `python -m botkit.memory.supabase`.
+1. In Supabase: SQL Editor -> run the output of `python -m botkit.memory`.
 2. Use the project URL and the **service_role** key (server side only, never in a browser/app).
 
     storage = SupabaseStorage()                       # reads SUPABASE_URL and SUPABASE_KEY
@@ -48,6 +48,11 @@ create index if not exists {f}_session_idx on {f} (session, id);
 -- Row level security on, no policies: only the service_role key can read/write these tables.
 alter table {m} enable row level security;
 alter table {f} enable row level security;
+-- The secret (service_role) key bypasses row level security but still needs table privileges.
+grant usage on schema public to service_role;
+grant all on table public.{m} to service_role;
+grant all on table public.{f} to service_role;
+grant usage, select on all sequences in schema public to service_role;
 """
 
 
@@ -155,6 +160,11 @@ class SupabaseStorage(Storage):
                     f"Supabase table '{table}' not found. Create botkit's tables first: run "
                     "SupabaseStorage.schema_sql() in the Supabase SQL editor."
                 ) from None
+            if e.code in (401, 403) and ("42501" in text or "permission denied" in text):
+                raise BotError(
+                    f"Supabase error {e.code}: permission denied on '{table}'. Use the secret (service_role) key "
+                    "and run the grant statements printed by SupabaseStorage.schema_sql()."
+                ) from None
             raise BotError(f"Supabase error {e.code}: {text}") from None
         except urllib.error.URLError as e:
             raise BotError(f"Could not reach Supabase: {e.reason}") from None
@@ -182,7 +192,3 @@ class SupabaseStorage(Storage):
 
     def delete_fact(self, session: str, fact_id: int) -> bool:
         return bool(self.table(self._f).delete({"id": int(fact_id), "session": session}))
-
-
-if __name__ == "__main__":  # python -m botkit.memory.supabase
-    print(schema_sql())

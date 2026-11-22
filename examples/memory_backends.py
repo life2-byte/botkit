@@ -31,7 +31,7 @@ def list_orders() -> str:
 bot = Agent(MODEL, memory=db, tools=[add_order, list_orders])
 
 # 2) Supabase instead of SQLite:
-#    - run `python -m botkit.memory.supabase` and paste the SQL into the Supabase SQL editor (once)
+#    - run `python -m botkit.memory` and paste the SQL into the Supabase SQL editor (once)
 #    - set SUPABASE_URL and SUPABASE_KEY (the service_role key), then:
 #
 #    store = SupabaseStorage()

@@ -1,4 +1,4 @@
-"""Document tools (3): create_docx, create_xlsx, create_pptx. Needs: pip install 'botkit[docs]'."""
+"""Document tools (4): create_docx, create_xlsx, create_pptx, create_pdf. Needs: pip install 'botkit[docs]'."""
 from __future__ import annotations
 
 import re
@@ -12,7 +12,7 @@ OFFICE_EXT = {".docx", ".xlsx", ".pptx"}
 
 
 def _need(pip_name: str) -> ImportError:
-    return ImportError(f"This tool needs '{pip_name}'. Install it with: pip install 'botkit[docs]'")
+    return ImportError(f"This tool needs '{pip_name}'. Install it with: pip install 'techtide-botkit[docs]'")
 
 
 # ---------------------------------------------------------------- reading
@@ -192,4 +192,60 @@ def make(policy: Policy, sandbox=None) -> list[Tool]:
         prs.save(str(p))
         return f"Created {rel(p)} ({len(slides)} slides)"
 
-    return [create_docx, create_xlsx, create_pptx]
+    @tool
+    def create_pdf(path: str, title: str, content: str) -> str:
+        """Create a PDF document. Content uses simple markdown: # headings, - bullets, 1. numbered, **bold**, | tables |.
+
+        Args:
+            path: Output path relative to the workspace, e.g. "report.pdf".
+            title: Document title.
+            content: The body in simple markdown.
+        """
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        except ImportError:
+            raise _need("reportlab") from None
+        from xml.sax.saxutils import escape
+
+        def inline(text: str) -> str:
+            return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escape(text))
+
+        p = target(path, ".pdf")
+        styles = getSampleStyleSheet()
+        story: list[Any] = [Paragraph(inline(title), styles["Title"]), Spacer(1, 12)]
+        table: list[list[str]] = []
+
+        def flush_table() -> None:
+            if table:
+                t = Table([[Paragraph(inline(c), styles["BodyText"]) for c in row] for row in table], repeatRows=1)
+                t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                                       ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke)]))
+                story.extend([t, Spacer(1, 8)])
+                table.clear()
+
+        for raw in content.splitlines():
+            line = raw.rstrip()
+            if line.strip().startswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
+                    table.append(cells)
+                continue
+            flush_table()
+            m = re.match(r"(#{1,3})\s+(.*)", line)
+            if m:
+                story.append(Paragraph(inline(m.group(2)), styles[f"Heading{len(m.group(1))}"]))
+            elif re.match(r"\s*[-*]\s+", line):
+                story.append(Paragraph("&bull; " + inline(re.sub(r"^\s*[-*]\s+", "", line)), styles["BodyText"]))
+            elif line.strip():
+                story.append(Paragraph(inline(line), styles["BodyText"]))
+            else:
+                story.append(Spacer(1, 6))
+        flush_table()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        SimpleDocTemplate(str(p), pagesize=A4, title=title).build(story)
+        return f"Created {rel(p)}"
+
+    return [create_docx, create_xlsx, create_pptx, create_pdf]

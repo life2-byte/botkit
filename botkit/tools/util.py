@@ -1,4 +1,4 @@
-"""Utility tool (1): calculate. Exact, safe arithmetic (no eval of arbitrary code)."""
+"""Utility tools (2): calculate (exact, safe arithmetic, no eval of arbitrary code) and current_time."""
 from __future__ import annotations
 
 import ast
@@ -62,4 +62,24 @@ def make(policy: Policy, sandbox=None) -> list[Tool]:
         """
         return str(safe_eval(expression))
 
-    return [calculate]
+    @tool
+    def current_time(timezone: str = "") -> str:
+        """Get the current date and time. Use this instead of guessing what day it is.
+
+        Args:
+            timezone: Optional IANA timezone name such as "Asia/Karachi" or "UTC" (default: this machine's timezone).
+        """
+        from datetime import datetime
+
+        if timezone:
+            try:
+                from zoneinfo import ZoneInfo
+
+                now = datetime.now(ZoneInfo(timezone))
+            except Exception:  # noqa: BLE001
+                raise ValueError(f"unknown timezone '{timezone}' (use names like 'Asia/Karachi' or 'UTC')") from None
+        else:
+            now = datetime.now().astimezone()
+        return now.strftime("%A, %d %B %Y, %H:%M:%S %Z (UTC%z)")
+
+    return [calculate, current_time]

@@ -4,3 +4,7 @@ class BotError(Exception):
 
 class LLMError(BotError):
     """The language model call failed (after retries)."""
+
+
+class GraphError(BotError):
+    """A node of a multi-agent graph failed, or the graph is built wrongly."""

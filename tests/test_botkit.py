@@ -186,7 +186,8 @@ def test_events_callback():
     events = []
     llm = FakeLLM(call("add", {"a": 1, "b": 2}), say("3"))
     Agent(llm=llm, tools=[add], on_event=lambda k, d: events.append((k, d.get("name")))).chat("x")
-    assert events == [("tool_call", "add"), ("tool_result", "add")]
+    assert [e for e in events if e[0] != "llm_call"] == [("tool_call", "add"), ("tool_result", "add")]
+    assert [e[0] for e in events].count("llm_call") == 2
 
 
 # ---------------------------------------------------------------- memory
