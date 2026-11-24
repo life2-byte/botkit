@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from .agent import Agent
 from .chatio import ChatMixin
-from .errors import GraphError
+from .errors import BotError, GraphError
 from .memory import Memory, SQLiteStorage, Storage
 from .trace import Trace, log
 
@@ -121,6 +121,38 @@ def _ident(name: str) -> str:
     return re.sub(r"\W", "_", name)
 
 
+class _Run:
+    """One graph run in progress. Saved when a node fails, so `resume()` can carry on instead of starting over."""
+
+    def __init__(self, state: State, frontier: list[str], user_input: str | None = None) -> None:
+        self.state = state
+        self.frontier = frontier                      # the level that runs next
+        self.steps = 0
+        self.finals: list[str] = []
+        self.done: dict[str, tuple[str, str | None]] = {}   # results of this level that already finished: name -> (text, previous)
+        self.user_input = user_input                  # set for chat() turns (so resume() can record the turn)
+
+    def to_dict(self) -> dict[str, Any]:
+        st = self.state
+        return {
+            "version": 1, "user_input": self.user_input, "frontier": self.frontier, "steps": self.steps,
+            "finals": self.finals, "done": {k: list(v) for k, v in self.done.items()},
+            "state": {"task": st.task, "context": st.context, "outputs": st.outputs, "last": st.last,
+                      "shared": st.shared, "visits": st.visits, "approved": st.approved, "worked": st.worked},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "_Run":
+        sd = d["state"]
+        st = State(sd["task"], sd.get("context", ""))
+        st.outputs, st.last, st.shared = dict(sd["outputs"]), sd["last"], dict(sd["shared"])
+        st.visits, st.approved, st.worked = dict(sd["visits"]), sd["approved"], dict(sd["worked"])
+        run = cls(st, list(d["frontier"]), d.get("user_input"))
+        run.steps, run.finals = int(d["steps"]), list(d["finals"])
+        run.done = {k: (v[0], v[1]) for k, v in d.get("done", {}).items()}
+        return run
+
+
 class Graph(ChatMixin):
     """A workflow of agents. Build it, then use it exactly like an Agent: `chat`, `stream`, `run`, `serve`.
 
@@ -140,6 +172,9 @@ class Graph(ChatMixin):
         output: name of the node whose output is the final answer (default: the node(s) that end the run).
         memory / session: conversation memory for the graph as a whole (history + facts), like Agent's.
         trace: True/Trace records the full flow: node starts and ends, every edge taken, model and tool calls.
+        checkpoint: path of a JSON file. When a node fails (API limit, outage...) the run is saved there, and
+            `graph.resume()` continues from the failed node, even after a restart. Without it the run is still kept
+            in memory for `resume()` until the program ends.
     """
 
     def __init__(
@@ -157,6 +192,7 @@ class Graph(ChatMixin):
         name: str = "graph",
         description: str = "",
         on_event: Callable[[str, dict], None] | None = None,
+        checkpoint: str | Path | None = None,
     ) -> None:
         if on_error not in ("raise", "continue"):
             raise ValueError('on_error must be "raise" or "continue"')
@@ -173,9 +209,11 @@ class Graph(ChatMixin):
         self._ids: dict[int, str] = {}
         self._chain = False
         self._lock = threading.RLock()
+        self.checkpoint = Path(checkpoint).expanduser() if checkpoint else None
+        self._paused: _Run | None = None
         self._prepared = False
         self._closed = False
-        self._params = dict(max_steps=max_steps, max_visits=max_visits, on_error=on_error, max_history=max_history)
+        self._params = dict(max_steps=max_steps, max_visits=max_visits, on_error=on_error, max_history=max_history)  # (fork adds its own checkpoint)
         self.memory: Memory | None = Agent._resolve_memory(memory, session, max_history)
         self.messages: list[dict] = self.memory.load() if self.memory else []
         if start is not None:
@@ -285,15 +323,11 @@ class Graph(ChatMixin):
 
     # ---- running ----------------------------------------------------------------
     def chat(self, user_input: str, on_token: Callable[[str], None] | None = None) -> str:
-        """One user turn through the whole workflow. Returns the final answer."""
+        """One user turn through the whole workflow. Returns the final answer.
+        If a node fails (API limit, outage...), the progress is kept: `resume()` continues from that node."""
         with self._lock:
-            context = self._context()
-            answer = self.run_state(user_input, context=context, on_token=on_token).final
-            turn = [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
-            self.messages.extend(turn)
-            if self.memory:
-                self.memory.extend(turn)
-            return answer
+            run = _Run(State(user_input, self._context()), list(self._start), user_input)
+            return self._finish(self._drive(run, on_token), user_input)
 
     def invoke(self, task: str) -> str:
         """Run the workflow once, without conversation memory."""
@@ -301,16 +335,79 @@ class Graph(ChatMixin):
 
     def run_state(self, task: str, *, context: str = "", on_token: Callable[[str], None] | None = None) -> State:
         """Like invoke(), but returns the full State (outputs of every node, visits, approved, `final`)."""
+        return self._drive(_Run(State(task, context), list(self._start)), on_token)
+
+    def _finish(self, state: State, user_input: str) -> str:
+        turn = [{"role": "user", "content": user_input}, {"role": "assistant", "content": state.final}]
+        self.messages.extend(turn)
+        if self.memory:
+            self.memory.extend(turn)
+        return state.final
+
+    # ---- pause and resume -----------------------------------------------------------
+    @property
+    def interrupted(self) -> bool:
+        """True if a run stopped on an error and `resume()` can continue it."""
+        return self._load_paused() is not None
+
+    def _load_paused(self) -> _Run | None:
+        if self._paused is None and self.checkpoint and self.checkpoint.exists():
+            try:
+                run = _Run.from_dict(json.loads(self.checkpoint.read_text(encoding="utf-8")))
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+            if all(n in self.nodes for n in run.frontier) or not self.nodes:
+                self._paused = run
+        return self._paused
+
+    def _save_paused(self, run: _Run) -> None:
+        self._paused = run
+        if self.checkpoint:
+            try:
+                self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.checkpoint.with_suffix(self.checkpoint.suffix + ".tmp")
+                tmp.write_text(json.dumps(run.to_dict(), ensure_ascii=False, default=str), encoding="utf-8")
+                tmp.replace(self.checkpoint)
+            except OSError as e:
+                self._emit("error", node=self.name, error=f"could not write checkpoint: {e}")
+
+    def _clear_paused(self) -> None:
+        self._paused = None
+        if self.checkpoint:
+            try:
+                self.checkpoint.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def resume(self, on_token: Callable[[str], None] | None = None) -> str:
+        """Continue the run that stopped on an error, from the node that failed: everything that already finished
+        is kept, only the failed step runs again. Raises BotError if there is nothing to resume."""
+        with self._lock:
+            run = self._load_paused()
+            if run is None:
+                raise BotError("Nothing to resume: no run was interrupted.")
+            missing = [n for n in run.frontier if n not in self.nodes]
+            if missing:
+                raise BotError(f"The saved run needs nodes that do not exist any more: {missing}")
+            state = self._drive(run, on_token, resumed=True)
+            return self._finish(state, run.user_input) if run.user_input is not None else state.final
+
+    def _drive(self, run: _Run, on_token: Callable[[str], None] | None, resumed: bool = False) -> State:
         self.validate()
         self._prepare()
-        state = State(task, context)
+        state = run.state
         t0 = time.monotonic()
-        self._emit("graph_start", node=self.name, task=task[:200])
+        if not resumed:
+            self._clear_paused()  # a fresh run replaces an old interrupted one
+        self._emit("graph_resume" if resumed else "graph_start", node=self.name, task=state.task[:200],
+                   next=list(run.frontier))
         try:
-            final = self._execute(state, on_token)
+            final = self._execute(run, on_token)
         except BaseException as e:
-            self._emit("error", node=self.name, error=f"{type(e).__name__}: {e}")
+            self._emit("error", node=self.name, error=f"{type(e).__name__}: {e}", resumable=True)
+            self._save_paused(run)
             raise
+        self._clear_paused()
         state.final = final
         self._emit("graph_end", node=self.name, seconds=round(time.monotonic() - t0, 3), chars=len(final))
         return state
@@ -327,23 +424,25 @@ class Graph(ChatMixin):
             parts.append("Conversation so far:\n" + text[-6000:])
         return "\n\n".join(parts)
 
-    def _execute(self, state: State, on_token: Callable[[str], None] | None) -> str:
-        frontier, steps, finals = list(self._start), 0, []
-        while frontier:
+    def _execute(self, run: _Run, on_token: Callable[[str], None] | None) -> str:
+        state = run.state
+        while run.frontier:
             level: list[str] = []
-            for n in dict.fromkeys(frontier):
+            for n in dict.fromkeys(run.frontier):
                 if state.visits.get(n, 0) >= self.max_visits:
                     self._emit("loop_limit", node=n, max_visits=self.max_visits)
                     continue
                 level.append(n)
             if not level:
                 break
-            if steps + len(level) > self.max_steps:
+            if run.steps + len(level) > self.max_steps:
                 self._emit("step_limit", node=self.name, max_steps=self.max_steps)
                 break
-            steps += len(level)
-            results = self._run_level(level, state, on_token if len(level) == 1 else None)
-            frontier, finals = [], []
+            results = self._run_level(level, run, on_token if len(level) == 1 else None)
+            run.steps += len(level)
+            run.done = {}
+            frontier: list[str] = []
+            finals: list[str] = []
             for name, text, previous in results:
                 state.outputs[name] = text
                 state.last = text
@@ -361,7 +460,8 @@ class Graph(ChatMixin):
                 for t in targets:
                     self._emit("edge", node=name, to=t)
                 frontier.extend(targets)
-        return self._final(state, finals)
+            run.frontier, run.finals = frontier, finals
+        return self._final(state, run.finals)
 
     def _next(self, name: str, state: State) -> list[str]:
         out = [e for e in self.edges if e.src == name]
@@ -390,16 +490,31 @@ class Graph(ChatMixin):
             return texts[0][1]
         return "\n\n".join(f"## {n}\n{t}" for n, t in texts)
 
-    def _run_level(self, level: list[str], state: State, on_token: Callable[[str], None] | None) -> list[tuple]:
+    def _run_level(self, level: list[str], run: _Run, on_token: Callable[[str], None] | None) -> list[tuple]:
+        state = run.state
+
         def one(name: str) -> tuple[str, str, str | None]:
+            if name in run.done:  # finished before the interruption: do not pay for it twice
+                text, previous = run.done[name]
+                return name, text, previous
             previous = state.outputs.get(name)
-            return name, self._run_node(self.nodes[name], state, on_token), previous
+            text = self._run_node(self.nodes[name], state, on_token)
+            run.done[name] = (text, previous)
+            return name, text, previous
 
         if len(level) == 1:
             return [one(level[0])]
+        results, error = [], None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(level), 8)) as pool:
             futures = [pool.submit(one, n) for n in level]
-            return [f.result() for f in futures]  # in level order; failures were already handled in _run_node
+            for f in futures:  # let every branch finish (and be saved) before reporting a failure
+                try:
+                    results.append(f.result())
+                except BaseException as e:  # noqa: BLE001
+                    error = error or e
+        if error is not None:
+            raise error
+        return results  # in level order
 
     def _prompt(self, node: _Node, state: State) -> str:
         if callable(node.input):
@@ -501,6 +616,7 @@ class Graph(ChatMixin):
 
     def reset(self) -> None:
         with self._lock:
+            self._clear_paused()
             self.messages = []
             if self.memory:
                 self.memory.clear_history()
@@ -510,6 +626,8 @@ class Graph(ChatMixin):
         g = Graph(
             start=None, output=self._output, session=session, trace=self.trace, name=self.name,
             description=self.description, on_event=self.on_event, memory=None, **self._params,
+            checkpoint=(self.checkpoint.with_name(f"{self.checkpoint.stem}.{session}{self.checkpoint.suffix}")
+                        if self.checkpoint else None),
         )
         g.memory = self.memory.for_session(session) if self.memory else None
         g.messages = g.memory.load() if g.memory else []

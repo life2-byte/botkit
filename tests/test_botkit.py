@@ -172,14 +172,14 @@ def test_step_limit_gives_final_answer():
     assert llm.seen[2][1] is None  # final call has no tools
 
 
-def test_llm_failure_rolls_back_so_retry_works():
+def test_llm_failure_keeps_the_work_so_resume_continues():
     llm = FakeLLM(call("add", {"a": 1, "b": 2}), LLMError("down"), say("recovered"))
     bot = Agent(llm=llm, tools=[add])
     with pytest.raises(LLMError):
         bot.chat("first")
-    assert bot.messages == []
-    assert bot.chat("again") == "recovered"
-    assert [m["role"] for m in bot.messages] == ["user", "assistant"]
+    assert [m["role"] for m in bot.messages] == ["user", "assistant", "tool"]
+    assert bot.resume() == "recovered"
+    assert [m["role"] for m in bot.messages] == ["user", "assistant", "tool", "assistant"]
 
 
 def test_events_callback():

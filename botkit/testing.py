@@ -33,6 +33,11 @@ def call(name: str, args: dict | str | None = None, id: str = "c1") -> dict:
         {"id": id, "type": "function", "function": {"name": name, "arguments": raw}}]}
 
 
+def fail(kind: str = "quota", message: str = "simulated failure", retry_after: float | None = None) -> LLMError:
+    """A scripted failure: FakeLLM(fail("quota"), say("never reached")). Use it to test fallback and resume."""
+    return LLMError(message, kind=kind, retry_after=retry_after)
+
+
 class FakeLLM:
     """A model that plays back scripted replies (and records what it was sent), safe to use from threads.
 

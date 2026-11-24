@@ -7,6 +7,8 @@
     BotKit(model, mode="parallel", agents=[...], merge="synthesizer")   # all at once, then merged
     BotKit(model, review=True)                                          # worker + reviewer correction loop
     BotKit(graph=my_graph)                                              # your own graph (loops, branching)
+    BotKit(model, fallback=["groq:openai/gpt-oss-120b"])                # switch model when this one hits a limit
+    team = BotKit(model, multi_agent=True, checkpoint="run.json")       # a failed run can be continued: team.resume()
 
 It returns an `Agent` for single mode and a `Graph` for everything else. Both are used the same way:
 chat(), stream(), run(), serve(), fork(), close(). Simple outside, complicated inside.
@@ -109,6 +111,7 @@ class BotKit:
         memory: Any = None,
         session: str = "default",
         trace: Any = None,
+        checkpoint: Any = None,
         **agent_options: Any,
     ) -> Agent | Graph:
         if mode not in (None, "single", "sequential", "parallel", "custom"):
@@ -121,6 +124,10 @@ class BotKit:
             if memory is not None and graph.memory is None:
                 graph.memory = Agent._resolve_memory(memory, session, graph.max_history)
                 graph.messages = graph.memory.load() if graph.memory else []
+            if checkpoint and graph.checkpoint is None:
+                from pathlib import Path
+
+                graph.checkpoint = Path(checkpoint).expanduser()
             return graph
         if mode == "custom":
             raise GraphError('mode="custom" needs graph=... (build one with botkit.Graph)')
@@ -136,7 +143,8 @@ class BotKit:
         shared = dict(agent_options)
         if shared.get("mcp"):
             shared["mcp"] = normalize(shared["mcp"])
-        gopts = dict(max_steps=max_graph_steps, memory=memory, session=session, trace=trace if trace is not None else True)
+        gopts = dict(max_steps=max_graph_steps, memory=memory, session=session, trace=trace if trace is not None else True,
+                     checkpoint=checkpoint)
 
         if mode == "parallel":
             if not agents or len(agents) < 2:

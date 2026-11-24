@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from .chatio import ChatMixin
 from .errors import BotError, LLMError
-from .llm import LLM
+from .llm import LLM, FallbackLLM
 from .mcp import MCP, normalize
 from .memory import Memory, SQLiteStorage, Storage, compact_history, trim_history, trim_to_tokens
 from .sandbox import DockerSandbox, make_sandbox
@@ -125,6 +125,8 @@ class Agent(ChatMixin):
         name / description: how this agent is called inside a multi-agent graph.
         trace: True (or a Trace object) records every model call, tool call and error in `bot.trace`.
         llm: bring your own object with `.chat(messages, tools)`; add `.stream(...)` to support streaming.
+        fallback: other models to switch to when this one fails (usage limit, quota, outage): "provider:model", a dict
+            or a list of those. The same request goes to the next model, so the work keeps going. See FallbackLLM.
         verbose / on_event: watch tool calls.
     """
 
@@ -157,6 +159,7 @@ class Agent(ChatMixin):
         api_key: str | None = None,
         base_url: str | None = None,
         llm: Any = None,
+        fallback: Any = None,
         verbose: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
@@ -178,6 +181,10 @@ class Agent(ChatMixin):
         self.approve = approve
         self.session = session
         self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature)
+        if fallback and not isinstance(self.llm, FallbackLLM):
+            self.llm = FallbackLLM(self.llm, fallback, temperature=temperature)
+        if isinstance(self.llm, FallbackLLM) and self.llm.on_switch is None:
+            self.llm.on_switch = lambda a, b, err: self._emit("fallback", frm=a, to=b, error=str(err)[:200])
 
         self._tools: dict[str, Tool] = {}
         self._mcp_tools: dict[str, Tool] = {}
@@ -263,8 +270,9 @@ class Agent(ChatMixin):
         """Run one user turn: call the model, run any tools it asks for, repeat, return the final text.
 
         `on_token(text)` is called with each piece of text while the model writes it (streaming).
-        Raises LLMError if the model API keeps failing. If a turn fails, the conversation is rolled
-        back to its state before the turn, so you can simply try again.
+        Raises LLMError if the model API keeps failing (after any `fallback` models were tried). The work done so far
+        is KEPT: call `bot.resume()` later (even after a restart, when memory is on) and it carries on from there.
+        Any other failure rolls the conversation back to its state before the turn.
         """
         with self._lock:
             self._start_mcp()
@@ -272,12 +280,60 @@ class Agent(ChatMixin):
             self.messages.append({"role": "user", "content": user_input})
             try:
                 answer = self._run_turn(start, on_token)
+            except LLMError as e:
+                self._emit("error", error=f"{type(e).__name__}: {e}", resumable=True)
+                if self.memory:
+                    self.memory.extend(self.messages[start:])
+                raise
             except BaseException as e:
                 del self.messages[start:]
                 self._emit("error", error=f"{type(e).__name__}: {e}")
                 raise
             if self.memory:
                 self.memory.extend(self.messages[start:])
+            return answer
+
+    def _unfinished_start(self) -> int | None:
+        """Index of the user message of a turn that never got its final answer (None = nothing to resume)."""
+        m = self.messages
+        if not m:
+            return None
+        last = m[-1]
+        if last.get("role") == "assistant" and not last.get("tool_calls"):
+            return None
+        for i in range(len(m) - 1, -1, -1):
+            if m[i].get("role") == "user" and not str(m[i].get("content", "")).startswith("[system]"):
+                return i
+        return None
+
+    @property
+    def interrupted(self) -> bool:
+        """True if the last turn stopped before it finished (API limit, outage...) and `resume()` can continue it."""
+        return self._unfinished_start() is not None
+
+    def resume(self, on_token: Callable[[str], None] | None = None) -> str:
+        """Continue the turn that was interrupted (for example by an API limit), with everything it already did.
+        Works after a restart too when memory is on. Raises BotError if there is nothing to resume."""
+        with self._lock:
+            self._start_mcp()
+            start = self._unfinished_start()
+            if start is None:
+                raise BotError("Nothing to resume: the last turn already finished.")
+            before = len(self.messages)
+            self._emit("resume", agent=self.name, steps_done=before - start)
+            try:
+                answer = self._run_turn(start, on_token)
+            except LLMError as e:
+                self._emit("error", error=f"{type(e).__name__}: {e}", resumable=True)
+                if self.memory:
+                    self.memory.extend(self.messages[before:])
+                raise
+            except BaseException as e:
+                del self.messages[before:]
+                self._emit("error", error=f"{type(e).__name__}: {e}")
+                raise
+            if self.memory:
+                self.memory.extend(self.messages[before:])
             return answer
 
     def __or__(self, other: Any) -> Any:

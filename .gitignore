@@ -24,3 +24,4 @@ __pycache__/
 workspace/
 ws_test/
 *.db
+ck_test.json

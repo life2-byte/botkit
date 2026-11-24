@@ -10,7 +10,7 @@
 [![Memory](https://img.shields.io/badge/memory-SQLite%20%7C%20Supabase%20%7C%20custom-f97316)](#-memory)
 [![Models](https://img.shields.io/badge/models-Groq%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Claude%20%7C%20Gemini%20%7C%20Ollama-8b5cf6)](#-providers)
 
-**[Install](#-install)** · **[Quick start](#-quick-start-in-60-seconds)** · **[Multi-agent](#-multi-agent-workflows)** · **[Tools](#-bundled-tools-17)** · **[Memory](#-memory)** · **[Deploy](#-deploying)** · **[FAQ](#-faq)**
+**[Install](#-install)** · **[Quick start](#-quick-start-in-60-seconds)** · **[Multi-agent](#-multi-agent-workflows)** · **[Tools](#-bundled-tools-17)** · **[Memory](#-memory)** · **[Limits & resume](#-limits-fallback-and-resume)** · **[Deploy](#-deploying)** · **[FAQ](#-faq)**
 
 </div>
 
@@ -322,6 +322,49 @@ register_provider("mycorp", "https://llm.corp/v1", "CORP_KEY")                  
 
 `botkit providers` lists them with their key variables. A server that cannot stream falls back to normal replies automatically.
 
+## 🛟 Limits, fallback and resume
+
+Long jobs hit walls: a daily quota, a rate limit, a provider outage. botkit handles all three, in the single agent loop and in graphs.
+
+**1. Fallback models.** If a model fails, the *same request* goes to the next one and the work keeps going.
+
+```python
+bot  = BotKit("deepseek:deepseek-chat", fallback=["groq:openai/gpt-oss-120b", "claude:claude-sonnet-4-5"])
+team = BotKit("groq:openai/gpt-oss-120b", multi_agent=True, fallback=["openai:gpt-4o-mini"])   # every agent gets it
+coder = Agent("deepseek:deepseek-chat", fallback="groq:openai/gpt-oss-120b")                   # or per agent
+```
+
+A model that just failed is skipped for a while (as long as the provider said, or 2 minutes; 10 minutes for a quota) and then tried again. Switches show up in the trace as `fallback` events. A fallback whose API key is missing is skipped, never fatal.
+
+**2. Limits are understood.** A *short* rate limit (per minute) is retried with backoff. A *hard* limit (daily quota, no credit, "try again in 12 minutes") is **not** retried: botkit fails over at once instead of sleeping. `LLMError.kind` tells you which it was (`quota`, `rate_limit`, `server`, `network`, `auth`, `exhausted`) and `LLMError.retry_after` says how many seconds to wait.
+
+**3. Nothing is lost: resume.** If every model fails, the work already done is kept.
+
+```python
+try:
+    bot.chat("Build the report and save it as report.docx")
+except LLMError as e:
+    print(e.kind, e.retry_after)        # e.g. quota 758.0  ->  come back later
+
+bot.interrupted      # True
+bot.resume()         # continues from where it stopped: finished tool calls are not repeated
+```
+
+- **Agent loop:** with `memory=` the interrupted turn is saved, so `resume()` works even after a restart.
+- **Graph / team:** the run is saved when a node fails; `team.resume()` runs only the failed node and what comes after it. Nodes that already finished are not paid for twice, also not the finished branches of a parallel level. Add `checkpoint="run.json"` to keep that state on disk across restarts.
+- **Terminal chat:** type `/resume`.
+- Not covered: with `on_error="continue"` (the default of parallel mode) a failed branch becomes error text instead of pausing the run; give those agents a `fallback`.
+
+```python
+team = BotKit(MODEL, multi_agent=True, tools=True, checkpoint="run.json", fallback=["groq:llama-3.3-70b-versatile"])
+try:
+    team.chat("Write the launch plan")
+except LLMError:
+    ...                      # all models are limited right now
+# ...hours later, or after a restart:
+print(team.resume())
+```
+
 ## ⚡ Streaming, async and the HTTP server
 
 ```python
@@ -394,6 +437,8 @@ Other commands: `botkit chat` (terminal chat), `botkit sql` (Supabase SQL), `bot
 | `max_steps=` | 12 | model calls per turn (a final answer is forced at the limit) |
 | `max_context_tokens=` | 24000 | estimated token budget for old turns |
 | `approve=` `deny=` `policy=` | none | control which shell commands may run |
+| `fallback=` | none | other models to switch to on a limit or outage: `"provider:model"` or a list |
+| `checkpoint=` | none | graphs: JSON file where an interrupted run is saved for `resume()` |
 | `api_key=` `base_url=` `llm=` | from environment | provider key, endpoint, or your own client object |
 
 ## ❓ FAQ
@@ -408,6 +453,8 @@ Other commands: `botkit chat` (terminal chat), `botkit sql` (Supabase SQL), `bot
 
 **Why did my team take 30 seconds?** Each agent makes its own model calls, and review loops repeat work. Use a single agent for simple tasks, a faster model for planner and reviewer, or `review=True` without the planner.
 
+**What happens when my API limit runs out mid-task?** botkit switches to your `fallback=` models, and if all are limited it stops with the work kept; `resume()` continues later. See *Limits, fallback and resume*.
+
 **Is it free?** Yes, MIT licensed. You only pay your model provider.
 
 ## 📁 Project structure
@@ -420,7 +467,7 @@ botkit/
 │   ├── kit.py          BotKit: one entry point, picks single or graph mode from flags
 │   ├── agent.py        the loop (Agent)
 │   ├── graph.py        multi-agent engine: Graph, chain, parallel, roles
-│   ├── llm.py          providers, streaming, retries
+│   ├── llm.py          providers, streaming, retries, fallback models
 │   ├── trace.py        events, timings, logging
 │   ├── testing.py      FakeLLM and assertions
 │   ├── cli.py          botkit init | chat | sql | providers
@@ -439,6 +486,7 @@ botkit/
 - [ ] Image input
 - [ ] Exact token counting (counts are estimates today)
 - [ ] Scheduled tasks
+- [ ] Background job queue helpers (Celery / Redis recipes)
 
 ## 🧪 Development
 

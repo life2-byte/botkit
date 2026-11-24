@@ -74,7 +74,7 @@ class ChatMixin:
             yield item
 
     def run(self, prompt: str = "You: ", stream: bool = True) -> None:
-        """Interactive terminal chat. Type 'exit' to quit, '/clear' to forget this conversation."""
+        """Interactive terminal chat. Type 'exit' to quit, '/clear' to forget this conversation, '/resume' to continue an interrupted task."""
         print("Chat started. Type 'exit' to quit, '/clear' to reset.")
         while True:
             try:
@@ -91,6 +91,9 @@ class ChatMixin:
                 print("(conversation cleared)")
                 continue
             try:
+                if text == "/resume":
+                    print(f"Bot: {self.resume()}")  # type: ignore[attr-defined]
+                    continue
                 if stream:
                     print("Bot: ", end="", flush=True)
                     for piece in self.stream(text):
@@ -102,6 +105,8 @@ class ChatMixin:
                 print("\n(interrupted)")
             except BotError as e:
                 print(f"\n[error] {e}")
+                if getattr(self, "interrupted", False):
+                    print("(your work is saved: type /resume to continue it when the limit is over)")
             except Exception as e:  # noqa: BLE001 - keep the REPL alive
                 print(f"\n[error] {type(e).__name__}: {e}")
         self.close()  # type: ignore[attr-defined]
