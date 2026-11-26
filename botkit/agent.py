@@ -180,6 +180,10 @@ class Agent(ChatMixin):
         self.on_event = on_event
         self.approve = approve
         self.session = session
+        if llm is None and fallback:
+            # the first model is built lazily too: a missing key on it must not stop the fallbacks from working
+            primary: Any = {"model": model, **({"api_key": api_key} if api_key else {}), **({"base_url": base_url} if base_url else {})}
+            llm = FallbackLLM(primary, fallback, temperature=temperature)
         self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature)
         if fallback and not isinstance(self.llm, FallbackLLM):
             self.llm = FallbackLLM(self.llm, fallback, temperature=temperature)

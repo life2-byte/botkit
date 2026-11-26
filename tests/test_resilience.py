@@ -262,3 +262,58 @@ def test_botkit_flags(monkeypatch):
     assert str(team.checkpoint) == "run.json"
     bot = BotKit("groq:m", fallback=["groq:other"])
     assert isinstance(bot.llm, FallbackLLM) and bot.llm.model == "groq:m"
+
+
+def test_missing_key_on_primary_does_not_block_fallback(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    bot = Agent("groq:some-model", fallback=[FakeLLM(say("fallback works"))])
+    assert bot.chat("hi") == "fallback works"
+
+
+def test_checkpoint_is_written_after_every_level(tmp_path):
+    ck = tmp_path / "run.json"
+    seen = {}
+
+    def second(state):
+        seen["during"] = json.loads(ck.read_text())     # written after the first node finished, before the run ended
+        return "two"
+
+    g = Graph(checkpoint=ck)
+    g.add(lambda s: "one", name="a"); g.add(second, name="b")
+    g.edge("a", "b"); g.edge("b", END)
+    assert g.chat("go") == "two"
+    assert seen["during"]["frontier"] == ["b"] and seen["during"]["state"]["outputs"] == {"a": "one"}
+    assert not ck.exists()                                               # cleaned up when the run finished
+
+
+def test_crash_mid_run_resumes_in_a_new_process(tmp_path):
+    ck = tmp_path / "run.json"
+    calls = []
+
+    def build(crash):
+        def b(state):
+            calls.append("b")
+            if crash:
+                raise KeyboardInterrupt()    # simulates the process being stopped
+            return "two"
+
+        g = Graph(checkpoint=ck)
+        g.add(lambda s: calls.append("a") or "one", name="a"); g.add(b, name="b")
+        g.edge("a", "b"); g.edge("b", END)
+        return g
+
+    with pytest.raises(BaseException):
+        build(True).chat("go")
+    g2 = build(False)
+    assert g2.interrupted and g2.resume() == "two"
+    assert calls.count("a") == 1
+
+
+def test_fork_with_own_trace():
+    from botkit import Trace
+
+    g, *_ = _team(FakeLLM(say("ok")))
+    t = Trace()
+    child = g.fork("job1", trace=t)
+    child.chat("go")
+    assert t.flow() == ["planner", "worker", "reviewer"] and g.trace.flow() == []

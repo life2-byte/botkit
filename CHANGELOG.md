@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.3
+
+- A graph with `checkpoint=` now saves its state after **every finished step**, not only on failure: a long run survives a crash or restart and `resume()` continues from the last finished step.
+- `fallback=` no longer requires the first model's API key to exist at start-up (it is built lazily), so a missing key on the main model falls through to the fallbacks.
+- `BotKit(..., max_visits=N)`: how many times one node may run in a graph (default 10), next to `max_graph_steps`. Raise both for long tasks.
+- `Graph.fork(session, trace=Trace())`: a copy with its own event log, for many runs at the same time (used by the Django app's background jobs).
+
+## 0.4.2
+
+- **Fallback models:** `fallback=["groq:...", "claude:..."]` on Agent / BotKit / agent dicts. When a model hits a limit, quota or outage, the same request goes to the next model. Failed models cool down and are retried later; switches appear in the trace (`fallback`).
+- **Limits understood:** daily quota / no credit / "try again in 12m" is no longer retried in vain; `LLMError.kind` (`quota`, `rate_limit`, `server`, `network`, `auth`, `exhausted`, ...) and `LLMError.retry_after`.
+- **Resume, agent loop:** a turn stopped by an LLM error keeps its work; `agent.resume()` continues it (also after a restart when memory is on); `agent.interrupted`. (Before, a failed turn was rolled back. Other errors still roll back.)
+- **Resume, graphs:** a failed node pauses the run; `graph.resume()` re-runs only that node and continues. Finished nodes and finished parallel branches are kept. `checkpoint="run.json"` saves the run on disk.
+- Terminal chat: `/resume`. Testing: `fail(kind)` for scripted failures. New export: `FallbackLLM`.
+
 ## 0.4.1
 - **Every default agent has tools, scoped by role.** Tools are grouped by purpose (inspect, edit, documents, web, compute, run).
   Planner: inspect/web/compute. Worker: everything the app enabled. Reviewer: inspect/compute/web + run (when the owner gave a

@@ -107,6 +107,7 @@ class BotKit:
         merge: Any = None,
         max_rounds: int = 3,
         max_graph_steps: int = 25,
+        max_visits: int = 10,
         role_tools: bool = True,
         memory: Any = None,
         session: str = "default",
@@ -143,7 +144,7 @@ class BotKit:
         shared = dict(agent_options)
         if shared.get("mcp"):
             shared["mcp"] = normalize(shared["mcp"])
-        gopts = dict(max_steps=max_graph_steps, memory=memory, session=session, trace=trace if trace is not None else True,
+        gopts = dict(max_steps=max_graph_steps, max_visits=max_visits, memory=memory, session=session, trace=trace if trace is not None else True,
                      checkpoint=checkpoint)
 
         if mode == "parallel":

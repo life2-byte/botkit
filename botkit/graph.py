@@ -362,6 +362,9 @@ class Graph(ChatMixin):
 
     def _save_paused(self, run: _Run) -> None:
         self._paused = run
+        self._write_checkpoint(run)
+
+    def _write_checkpoint(self, run: _Run) -> None:
         if self.checkpoint:
             try:
                 self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +464,7 @@ class Graph(ChatMixin):
                     self._emit("edge", node=name, to=t)
                 frontier.extend(targets)
             run.frontier, run.finals = frontier, finals
+            self._write_checkpoint(run)  # a long run survives a crash or restart: it continues from the last finished level
         return self._final(state, run.finals)
 
     def _next(self, name: str, state: State) -> list[str]:
@@ -621,8 +625,9 @@ class Graph(ChatMixin):
             if self.memory:
                 self.memory.clear_history()
 
-    def fork(self, session: str) -> "Graph":
-        """A copy of this workflow for another user: own conversation, own agent histories and workspace folders."""
+    def fork(self, session: str, trace: Trace | None = None) -> "Graph":
+        """A copy of this workflow for another user: own conversation, own agent histories and workspace folders.
+        Pass `trace=Trace()` to give the copy its own event log (useful when many copies run at the same time)."""
         g = Graph(
             start=None, output=self._output, session=session, trace=self.trace, name=self.name,
             description=self.description, on_event=self.on_event, memory=None, **self._params,
@@ -641,6 +646,10 @@ class Graph(ChatMixin):
             g._ids.setdefault(id(forked), n.name)
         g.edges = list(self.edges)
         g._start, g._start_given = list(self._start), True
+        if trace is not None:
+            g.trace = trace
+            for a in g.agents:
+                a.trace = trace
         return g
 
     def close(self) -> None:
