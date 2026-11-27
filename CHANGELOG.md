@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.4
+
+- **`tool_mode="prompt"` (opt-in):** for a model or proxy that ignores the API `tools` field (for example a proxy in front of a chat website's web token, which otherwise creates files in its own sandbox). botkit describes the tools in the system prompt, reads a ```tool block from the model's text, and runs the tool in YOUR workspace. A bad block gets one correction round. Default is `tool_mode="native"`, which is unchanged: normal API users are not affected.
+- Works on `Agent`, `BotKit`, `LLM`, and per fallback model: `fallback=[{"model": "deepseek-web", "base_url": "...", "tool_mode": "prompt"}]`. Streaming in this mode replies whole, then emits the text (the tool block is never shown).
+
 ## 0.4.3
 
 - A graph with `checkpoint=` now saves its state after **every finished step**, not only on failure: a long run survives a crash or restart and `resume()` continues from the last finished step.

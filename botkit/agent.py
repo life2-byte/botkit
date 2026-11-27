@@ -127,6 +127,10 @@ class Agent(ChatMixin):
         llm: bring your own object with `.chat(messages, tools)`; add `.stream(...)` to support streaming.
         fallback: other models to switch to when this one fails (usage limit, quota, outage): "provider:model", a dict
             or a list of those. The same request goes to the next model, so the work keeps going. See FallbackLLM.
+        tool_mode: "native" (default: the provider's own tool calling) or "prompt" for a model/proxy that ignores the API
+            `tools` field (for example a proxy in front of a chat website's web token): tools are described in the prompt
+            and read back from the model's text. Applies to this agent's own model; for a fallback model put
+            {"model": ..., "tool_mode": "prompt"} in its dict. Use it only when the endpoint needs it.
         verbose / on_event: watch tool calls.
     """
 
@@ -160,6 +164,7 @@ class Agent(ChatMixin):
         base_url: str | None = None,
         llm: Any = None,
         fallback: Any = None,
+        tool_mode: str = "native",
         verbose: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
@@ -182,9 +187,10 @@ class Agent(ChatMixin):
         self.session = session
         if llm is None and fallback:
             # the first model is built lazily too: a missing key on it must not stop the fallbacks from working
-            primary: Any = {"model": model, **({"api_key": api_key} if api_key else {}), **({"base_url": base_url} if base_url else {})}
+            primary: Any = {"model": model, **({"api_key": api_key} if api_key else {}), **({"base_url": base_url} if base_url else {}),
+                             **({"tool_mode": tool_mode} if tool_mode != "native" else {})}
             llm = FallbackLLM(primary, fallback, temperature=temperature)
-        self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature)
+        self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature, tool_mode=tool_mode)
         if fallback and not isinstance(self.llm, FallbackLLM):
             self.llm = FallbackLLM(self.llm, fallback, temperature=temperature)
         if isinstance(self.llm, FallbackLLM) and self.llm.on_switch is None:
