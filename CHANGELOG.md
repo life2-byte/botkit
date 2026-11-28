@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.7
+
+- `llm_options={"conversation_header": "X-Conversation-Id"}` (or `"conversation_field": "conversation_id"`) on Agent / BotKit: every model request carries the id of its conversation (the agent's `session` for `chat()`/`resume()`, a fresh id per `ask()` so graph nodes never share a chat). For gateways in front of a chat website that keep one website chat per conversation. Normal APIs are unaffected: nothing is sent unless you ask.
+
 ## 0.4.6
 
 - `tool_prompt="user"` (with `tool_mode="prompt"`): the tool instructions go into the latest user message instead of the system prompt, for endpoints that ignore or replace the system prompt.

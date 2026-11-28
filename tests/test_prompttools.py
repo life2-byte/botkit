@@ -184,3 +184,33 @@ def test_bare_prompt_is_only_system_rules_security(tmp_path):
 def test_agent_passes_tool_prompt_options():
     a = Agent("openai:x", api_key="k", tool_mode="prompt", tool_prompt="user", tool_prompt_text="T {tools}")
     assert a.llm.tool_prompt == "user" and a.llm.tool_prompt_text == "T {tools}"
+
+
+def test_conversation_id_is_sent_only_when_asked():
+    from botkit.llm import CONVERSATION
+    llm = fake_llm(["a", "b"], conversation_header="X-Conversation-Id", conversation_field="conversation_id")
+    llm.chat([{"role": "user", "content": "x"}])
+    assert "extra_headers" not in llm.sent[0]                      # nothing set -> nothing sent
+    token = CONVERSATION.set("c14")
+    llm.chat([{"role": "user", "content": "x"}])
+    CONVERSATION.reset(token)
+    assert llm.sent[1]["extra_headers"] == {"X-Conversation-Id": "c14"} and llm.sent[1]["extra_body"] == {"conversation_id": "c14"}
+    plain = fake_llm(["a"])
+    token = CONVERSATION.set("c14"); plain.chat([{"role": "user", "content": "x"}]); CONVERSATION.reset(token)
+    assert "extra_headers" not in plain.sent[0] and "extra_body" not in plain.sent[0]   # normal APIs unchanged
+
+
+def test_agent_sets_session_for_chat_and_fresh_id_for_ask(tmp_path):
+    from botkit.llm import CONVERSATION
+    seen = []
+
+    class Spy:
+        def chat(self, messages, tools=None):
+            seen.append(CONVERSATION.get())
+            return {"role": "assistant", "content": "ok"}
+
+    a = Agent(llm=Spy(), session="c14", name="worker", workdir=tmp_path)
+    a.chat("hi"); a.chat("again"); a.ask("job"); a.ask("job")
+    assert seen[0] == seen[1] == "c14"
+    assert seen[2].startswith("c14:worker:") and seen[3].startswith("c14:worker:") and seen[2] != seen[3]
+    assert CONVERSATION.get() is None

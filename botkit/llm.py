@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import contextvars
 import threading
 import time
 from typing import Any, Callable
@@ -40,6 +41,11 @@ _QUOTA_WORDS = (
     "requests per day", "(tpd)", "(rpd)", "credit", "balance", "payment required",
 )
 LONG_WAIT = 60.0  # a rate limit that asks for more than this many seconds is treated as a hard limit: do not sit and wait
+
+
+# The conversation a model call belongs to. Agent sets it around every turn; an LLM created with
+# conversation_header= / conversation_field= sends it with each request (for gateways that keep one chat per conversation).
+CONVERSATION: contextvars.ContextVar = contextvars.ContextVar("botkit_conversation", default=None)
 
 
 def _parse_wait(text: str) -> float | None:
@@ -87,6 +93,8 @@ class LLM:
         tool_mode: str = "native",
         tool_prompt: str = "system",
         tool_prompt_text: str | None = None,
+        conversation_header: str | None = None,
+        conversation_field: str | None = None,
     ) -> None:
         import openai  # lazy: only needed when a real client is built
 
@@ -101,6 +109,8 @@ class LLM:
             raise LLMError(f"tool_mode must be one of {TOOL_MODES}, got {tool_mode!r}", kind="bad_request")
         if tool_prompt not in TOOL_PROMPTS:
             raise LLMError(f"tool_prompt must be one of {TOOL_PROMPTS}, got {tool_prompt!r}", kind="bad_request")
+        self.conversation_header = conversation_header
+        self.conversation_field = conversation_field
         self.tool_mode = tool_mode
         self.tool_prompt = tool_prompt
         self.tool_prompt_text = tool_prompt_text
@@ -146,6 +156,11 @@ class LLM:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        cid = CONVERSATION.get()
+        if cid and self.conversation_header:
+            kwargs["extra_headers"] = {self.conversation_header: cid}
+        if cid and self.conversation_field:
+            kwargs["extra_body"] = {self.conversation_field: cid}
         return kwargs
 
     def _request(self, attempt_fn: Callable[[], Any]) -> Any:

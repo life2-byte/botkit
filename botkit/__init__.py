@@ -29,4 +29,4 @@ __all__ = [
     "Storage", "SQLiteStorage", "SupabaseStorage", "Fact", "Policy", "Sandbox", "LocalSandbox", "DockerSandbox",
     "LLM", "FallbackLLM", "make_llm", "register_provider", "Trace", "BotError", "LLMError", "GraphError",
 ]
-__version__ = "0.4.6"
+__version__ = "0.4.7"

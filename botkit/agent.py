@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any, Callable
 
 from .chatio import ChatMixin
 from .errors import BotError, LLMError
-from .llm import LLM, FallbackLLM
+from .llm import CONVERSATION, LLM, FallbackLLM
 from .mcp import MCP, normalize
 from .memory import Memory, SQLiteStorage, Storage, compact_history, trim_history, trim_to_tokens
 from .sandbox import DockerSandbox, make_sandbox
@@ -137,6 +138,10 @@ class Agent(ChatMixin):
             {example} by a sample call. None = botkit's default text.
         bare_prompt: True = the system prompt is ONLY `system` + your `rules` + the security rules: no date, no tools
             list, no workspace sentence, no skills or memory text. Combine with system="" for a prompt that is all yours.
+        llm_options: extra options for this agent's own model client, e.g. {"conversation_header": "X-Conversation-Id"}
+            (or "conversation_field": "conversation_id" for the request body). The id sent is the agent's `session`
+            for chat()/resume(), and a fresh id per call for ask() (graph nodes). Gateways that keep one website chat
+            per conversation use it; normal APIs never need it.
         verbose / on_event: watch tool calls.
     """
 
@@ -174,6 +179,7 @@ class Agent(ChatMixin):
         tool_prompt: str = "system",
         tool_prompt_text: str | None = None,
         bare_prompt: bool = False,
+        llm_options: dict | None = None,
         verbose: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
@@ -199,10 +205,10 @@ class Agent(ChatMixin):
             # the first model is built lazily too: a missing key on it must not stop the fallbacks from working
             primary: Any = {"model": model, **({"api_key": api_key} if api_key else {}), **({"base_url": base_url} if base_url else {}),
                              **({"tool_mode": tool_mode, "tool_prompt": tool_prompt, "tool_prompt_text": tool_prompt_text}
-                                if tool_mode != "native" else {})}
+                                if tool_mode != "native" else {}), **(llm_options or {})}
             llm = FallbackLLM(primary, fallback, temperature=temperature)
         self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature, tool_mode=tool_mode,
-                              tool_prompt=tool_prompt, tool_prompt_text=tool_prompt_text)
+                              tool_prompt=tool_prompt, tool_prompt_text=tool_prompt_text, **(llm_options or {}))
         if fallback and not isinstance(self.llm, FallbackLLM):
             self.llm = FallbackLLM(self.llm, fallback, temperature=temperature)
         if isinstance(self.llm, FallbackLLM) and self.llm.on_switch is None:
@@ -300,6 +306,7 @@ class Agent(ChatMixin):
             self._start_mcp()
             start = len(self.messages)
             self.messages.append({"role": "user", "content": user_input})
+            token = CONVERSATION.set(self.session)
             try:
                 answer = self._run_turn(start, on_token)
             except LLMError as e:
@@ -311,6 +318,8 @@ class Agent(ChatMixin):
                 del self.messages[start:]
                 self._emit("error", error=f"{type(e).__name__}: {e}")
                 raise
+            finally:
+                CONVERSATION.reset(token)
             if self.memory:
                 self.memory.extend(self.messages[start:])
             return answer
@@ -343,6 +352,7 @@ class Agent(ChatMixin):
                 raise BotError("Nothing to resume: the last turn already finished.")
             before = len(self.messages)
             self._emit("resume", agent=self.name, steps_done=before - start)
+            token = CONVERSATION.set(self.session)
             try:
                 answer = self._run_turn(start, on_token)
             except LLMError as e:
@@ -354,6 +364,8 @@ class Agent(ChatMixin):
                 del self.messages[before:]
                 self._emit("error", error=f"{type(e).__name__}: {e}")
                 raise
+            finally:
+                CONVERSATION.reset(token)
             if self.memory:
                 self.memory.extend(self.messages[before:])
             return answer
@@ -370,12 +382,14 @@ class Agent(ChatMixin):
         with self._lock:
             self._start_mcp()
             saved, self.messages = self.messages, [{"role": "user", "content": prompt}]
+            token = CONVERSATION.set(f"{self.session}:{self.name}:{uuid.uuid4().hex[:8]}")
             try:
                 return self._run_turn(0, on_token)
             except BaseException as e:
                 self._emit("error", error=f"{type(e).__name__}: {e}")
                 raise
             finally:
+                CONVERSATION.reset(token)
                 self.messages = saved
 
     def tools_info(self) -> list[dict]:

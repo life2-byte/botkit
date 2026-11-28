@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "techtide-botkit"
-version = "0.4.6"
+version = "0.4.7"
 description = "An agent loop in a few lines, plus optional tools, skills, memory (SQLite/Supabase/your own), MCP and multi-agent workflows (sequential, parallel, custom graphs)."
 readme = "README.md"
 requires-python = ">=3.10"
