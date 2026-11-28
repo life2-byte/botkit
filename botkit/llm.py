@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from .prompttools import RETRY_NOTE, TOOL_MODES, looks_like_call, parse_reply, to_plain
+from .prompttools import RETRY_NOTE, TOOL_MODES, TOOL_PROMPTS, looks_like_call, parse_reply, to_plain
 from .errors import LLMError
 
 # provider -> (base_url, env var holding the API key)
@@ -85,6 +85,8 @@ class LLM:
         max_retries: int = 4,
         timeout: float = 60.0,
         tool_mode: str = "native",
+        tool_prompt: str = "system",
+        tool_prompt_text: str | None = None,
     ) -> None:
         import openai  # lazy: only needed when a real client is built
 
@@ -97,7 +99,11 @@ class LLM:
             raise LLMError(f"No API key for '{provider}'. Set the {key_env} environment variable or pass api_key=.")
         if tool_mode not in TOOL_MODES:
             raise LLMError(f"tool_mode must be one of {TOOL_MODES}, got {tool_mode!r}", kind="bad_request")
+        if tool_prompt not in TOOL_PROMPTS:
+            raise LLMError(f"tool_prompt must be one of {TOOL_PROMPTS}, got {tool_prompt!r}", kind="bad_request")
         self.tool_mode = tool_mode
+        self.tool_prompt = tool_prompt
+        self.tool_prompt_text = tool_prompt_text
         self.temperature = temperature
         self.max_retries = max_retries
         self._sleep = time.sleep
@@ -223,7 +229,7 @@ class LLM:
 
     def _prompt_chat(self, messages: list[dict], tools: list[dict] | None) -> dict:
         """tool_mode="prompt": tools described in the prompt, tool calls read from the model's text."""
-        plain = to_plain(messages, tools)
+        plain = to_plain(messages, tools, self.tool_prompt, self.tool_prompt_text)
         reply = self._native_chat(plain, None)
         text = reply.get("content") or ""
         content, calls, problems = parse_reply(text, tools)

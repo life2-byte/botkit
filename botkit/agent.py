@@ -131,6 +131,12 @@ class Agent(ChatMixin):
             `tools` field (for example a proxy in front of a chat website's web token): tools are described in the prompt
             and read back from the model's text. Applies to this agent's own model; for a fallback model put
             {"model": ..., "tool_mode": "prompt"} in its dict. Use it only when the endpoint needs it.
+        tool_prompt: with tool_mode="prompt": where the tool instructions go, "system" (default) or "user" (added to the
+            latest user message; use it when the endpoint seems to ignore or replace the system prompt).
+        tool_prompt_text: your own tool instructions for tool_mode="prompt". {tools} is replaced by the tool list and
+            {example} by a sample call. None = botkit's default text.
+        bare_prompt: True = the system prompt is ONLY `system` + your `rules` + the security rules: no date, no tools
+            list, no workspace sentence, no skills or memory text. Combine with system="" for a prompt that is all yours.
         verbose / on_event: watch tool calls.
     """
 
@@ -165,6 +171,9 @@ class Agent(ChatMixin):
         llm: Any = None,
         fallback: Any = None,
         tool_mode: str = "native",
+        tool_prompt: str = "system",
+        tool_prompt_text: str | None = None,
+        bare_prompt: bool = False,
         verbose: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
@@ -172,6 +181,7 @@ class Agent(ChatMixin):
         self.name = name
         self.description = description
         self.system = system
+        self.bare_prompt = bare_prompt
         self.max_context_tokens = max_context_tokens
         self.parallel_tools = parallel_tools
         self.trace: Trace | None = trace if isinstance(trace, Trace) else (Trace() if trace else None)
@@ -188,9 +198,11 @@ class Agent(ChatMixin):
         if llm is None and fallback:
             # the first model is built lazily too: a missing key on it must not stop the fallbacks from working
             primary: Any = {"model": model, **({"api_key": api_key} if api_key else {}), **({"base_url": base_url} if base_url else {}),
-                             **({"tool_mode": tool_mode} if tool_mode != "native" else {})}
+                             **({"tool_mode": tool_mode, "tool_prompt": tool_prompt, "tool_prompt_text": tool_prompt_text}
+                                if tool_mode != "native" else {})}
             llm = FallbackLLM(primary, fallback, temperature=temperature)
-        self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature, tool_mode=tool_mode)
+        self.llm = llm or LLM(model, api_key=api_key, base_url=base_url, temperature=temperature, tool_mode=tool_mode,
+                              tool_prompt=tool_prompt, tool_prompt_text=tool_prompt_text)
         if fallback and not isinstance(self.llm, FallbackLLM):
             self.llm = FallbackLLM(self.llm, fallback, temperature=temperature)
         if isinstance(self.llm, FallbackLLM) and self.llm.on_switch is None:
@@ -430,7 +442,13 @@ class Agent(ChatMixin):
                 )
 
     def _system_prompt(self) -> str:
-        parts = [self.system, f"Current date: {datetime.now().astimezone():%A, %d %B %Y}."]
+        if self.bare_prompt:
+            parts = [self.system] if self.system else []
+            if self.rules:
+                parts.append("Rules from the app owner (follow them):\n" + "\n".join(f"- {r}" for r in self.rules))
+            parts.append(SECURITY_PROMPT)
+            return "\n\n".join(parts)
+        parts = [p for p in (self.system, f"Current date: {datetime.now().astimezone():%A, %d %B %Y}.") if p]
         if not self._tools:  # some models try to call tools they were never given, which providers reject
             parts.append("You have no tools. Never try to call a tool; answer in plain text only.")
         if self._tools:

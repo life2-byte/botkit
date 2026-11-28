@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.6
+
+- `tool_prompt="user"` (with `tool_mode="prompt"`): the tool instructions go into the latest user message instead of the system prompt, for endpoints that ignore or replace the system prompt.
+- `tool_prompt_text="..."`: your own tool instructions; `{tools}` becomes the tool list and `{example}` a sample call. The default text is stricter (no sandbox of its own, reply with only the tool block) and now contains an example.
+- `bare_prompt=True`: the system prompt is only `system` + your `rules` + the security rules (no date, tools list, workspace sentence, skills or memory text). `system=""` no longer leaves blank lines at the start.
+
+## 0.4.5
+
+- `tool_mode="prompt"` now also understands a reply that is only JSON (no ```tool fence), `{"tool": ..., "args": ...}` and `{"write_file": {...}}` shapes, and matches tool names loosely (`Write-File` = `write_file`).
+- A call with an unknown tool or missing required arguments is no longer printed as text: the model gets one correction round that lists the valid tools and their required arguments.
+
 ## 0.4.4
 
 - **`tool_mode="prompt"` (opt-in):** for a model or proxy that ignores the API `tools` field (for example a proxy in front of a chat website's web token, which otherwise creates files in its own sandbox). botkit describes the tools in the system prompt, reads a ```tool block from the model's text, and runs the tool in YOUR workspace. A bad block gets one correction round. Default is `tool_mode="native"`, which is unchanged: normal API users are not affected.

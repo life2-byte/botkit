@@ -25,16 +25,33 @@ You can use tools. To call a tool, write a block exactly like this and nothing e
 ```
 
 Rules for tools:
-- Use ONLY the tools listed below. They run in the user's own workspace, not in any sandbox of yours. Do not say a file was created unless a tool result confirms it.
-- The block must be valid JSON. You may write several blocks in one reply to call several tools.
-- After your tool block(s), stop and wait. The results come back in the next message as "[tool result: name]".
+- Use ONLY the tools listed below. They run in the user's own workspace. You have no file system, sandbox or tools of your own here: never create, save or edit a file yourself, and never say a file exists unless a tool result confirms it.
+- When the user asks for something a tool can do (create, read, edit, search, calculate...), your ENTIRE reply must be the tool block(s), with no other text.
+- The block must be valid JSON. Use the exact tool name and the exact argument names from the list. Several blocks in one reply call several tools.
+- After your tool block(s), stop. The results come back in the next message as "[tool result: name]".
 - When no tool is needed, or when the task is finished, answer in plain text without any ```tool block.
 
+Example of a correct reply:
+{example}
+
 Available tools:
+{tools}
 """
 
+TOOL_PROMPTS = ("system", "user")
 
-def render_tools(tools: list[dict]) -> str:
+
+def _example(tools: list[dict]) -> str:
+    specs = [t.get("function", t) for t in tools]
+    f = next((x for x in specs if x.get("name") == "write_file"), specs[0] if specs else {"name": "tool", "parameters": {}})
+    params = f.get("parameters") or {}
+    props = params.get("properties", {}) or {}
+    args = {k: ("hello.txt" if k == "path" else "hi" if k == "content" else f"<{k}>") for k in (params.get("required") or list(props)[:2])}
+    return "```tool\n" + json.dumps({"name": f.get("name"), "arguments": args}) + "\n```"
+
+
+def render_tools(tools: list[dict], template: str | None = None) -> str:
+    """The tool instructions. `template` may use {tools} (the list) and {example}; default is INSTRUCTIONS."""
     lines = []
     for t in tools:
         f = t.get("function", t)
@@ -48,7 +65,7 @@ def render_tools(tools: list[dict]) -> str:
             args.append(f"    - {name} ({kind}{', required' if name in required else ''}){': ' + desc if desc else ''}")
         head = f"* {f.get('name')}: {(f.get('description') or '').strip().splitlines()[0] if f.get('description') else ''}"
         lines.append(head + ("\n" + "\n".join(args) if args else ""))
-    return INSTRUCTIONS + "\n".join(lines)
+    return (template or INSTRUCTIONS).replace("{example}", _example(tools) if tools else "").replace("{tools}", "\n".join(lines))
 
 
 def _call_text(calls: list[dict]) -> str:
@@ -63,7 +80,7 @@ def _call_text(calls: list[dict]) -> str:
     return "\n".join(out)
 
 
-def to_plain(messages: list[dict], tools: list[dict] | None) -> list[dict]:
+def to_plain(messages: list[dict], tools: list[dict] | None, place: str = "system", template: str | None = None) -> list[dict]:
     """Messages with tool calls/results rewritten as plain text, and the tool instructions added to the system prompt."""
     names: dict[str, str] = {}
     out: list[dict] = []
@@ -87,46 +104,97 @@ def to_plain(messages: list[dict], tools: list[dict] | None) -> list[dict]:
         else:
             merged.append(m)
     if tools:
-        block = render_tools(tools)
-        if merged and merged[0]["role"] == "system":
+        block = render_tools(tools, template)
+        last = next((i for i in range(len(merged) - 1, -1, -1) if merged[i]["role"] == "user"), None)
+        if place == "user" and last is not None:  # many chat websites follow the user's own message more than a system prompt
+            merged[last] = {"role": "user", "content": f"{block}\n\n---\n{merged[last]['content']}"}
+        elif merged and merged[0]["role"] == "system":
             merged[0] = {"role": "system", "content": f"{merged[0]['content']}\n\n{block}"}
         else:
             merged.insert(0, {"role": "system", "content": block})
     return merged
 
 
+def _norm(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name or "").lower()).strip("_")
+
+
+def _json_or_none(text: str) -> Any:
+    text = text.strip()
+    fence = re.match(r"^```(?:json)?[ \t]*\r?\n(.*?)```$", text, re.S | re.I)  # a plain ```json fence around the whole reply
+    if fence:
+        text = fence.group(1).strip()
+    if not text.startswith(("{", "[")):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
 def looks_like_call(text: str) -> bool:
-    return bool(re.search(r"```tool|<tool_call>", text or "", re.I))
+    return bool(re.search(r"```tool|<tool_call>", text or "", re.I)) or _json_or_none(text or "") is not None
+
+
+def _shape(data: Any, by_norm: dict[str, str]) -> tuple[str | None, Any]:
+    """(tool name as written, arguments) from the shapes models use: {"name","arguments"}, {"tool","args"}, {"write_file": {...}}."""
+    if not isinstance(data, dict):
+        return None, {}
+    if isinstance(data.get("function"), dict):
+        data = data["function"]
+    for key in ("name", "tool", "tool_name", "function"):
+        if isinstance(data.get(key), str):
+            args = next((data[k] for k in ("arguments", "args", "parameters", "input") if k in data), {})
+            return data[key], args
+    if len(data) == 1:  # {"Create-file": {"arguments": {...}}}
+        (key, inner), = data.items()
+        if isinstance(inner, dict):
+            args = next((inner[k] for k in ("arguments", "args", "parameters", "input") if k in inner), inner)
+            return key, args
+    return None, {}
 
 
 def parse_reply(text: str, tools: list[dict] | None) -> tuple[str, list[dict], list[str]]:
-    """(text without tool blocks, tool_calls in OpenAI shape, problems). Unknown tool names are reported as problems."""
-    known = {t.get("function", t).get("name") for t in tools or []}
+    """(text without tool blocks, tool_calls in OpenAI shape, problems).
+
+    Reads ```tool blocks, <tool_call> tags, and a reply that is nothing but JSON. Tool names are matched loosely
+    (case, - and _ ignored). A call with an unknown tool or missing required arguments is a problem, not a call."""
+    specs = {t.get("function", t).get("name"): t.get("function", t) for t in tools or []}
+    by_norm = {_norm(n): n for n in specs}
+    bodies = [*_BLOCK.findall(text or ""), *_TAG.findall(text or "")]
+    whole = None
+    if not bodies:
+        whole = _json_or_none(text or "")
+        if whole is not None:
+            bodies = [json.dumps(x) for x in (whole if isinstance(whole, list) else [whole])]
     calls: list[dict] = []
     problems: list[str] = []
-    for body in [*_BLOCK.findall(text or ""), *_TAG.findall(text or "")]:
-        body = body.strip()
+    valid = ", ".join(f"{n}({', '.join((f.get('parameters') or {}).get('required', []))})" for n, f in specs.items())
+    for body in bodies:
         try:
-            data = json.loads(body)
+            data = json.loads(body.strip())
         except ValueError:
-            problems.append(f"not valid JSON: {body[:80]}")
+            problems.append(f"not valid JSON: {body.strip()[:80]}")
             continue
-        if isinstance(data, dict) and "function" in data and isinstance(data["function"], dict):
-            data = data["function"]
-        name = data.get("name") if isinstance(data, dict) else None
-        args = (data.get("arguments", data.get("parameters", {})) if isinstance(data, dict) else {}) or {}
+        raw, args = _shape(data, by_norm)
+        name = by_norm.get(_norm(raw))
         if isinstance(args, str):
             try:
                 args = json.loads(args)
             except ValueError:
-                problems.append(f"arguments of {name} are not valid JSON")
+                problems.append(f"arguments of {raw} are not valid JSON")
                 continue
-        if name not in known:
-            problems.append(f"unknown tool: {name}")
+        if name is None:
+            problems.append(f"unknown tool {raw!r}; valid tools with their required arguments: {valid}")
+            continue
+        args = args if isinstance(args, dict) else {}
+        missing = [r for r in (specs[name].get("parameters") or {}).get("required", []) if r not in args]
+        if missing:
+            problems.append(f"{name} needs the arguments {', '.join(missing)} (you sent {', '.join(args) or 'none'})")
             continue
         calls.append({"id": f"call_{uuid.uuid4().hex[:10]}", "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-    clean = _TAG.sub("", _BLOCK.sub("", text or "")).strip()
+    clean = "" if whole is not None else _TAG.sub("", _BLOCK.sub("", text or "")).strip()
     return clean, calls, problems
 
 

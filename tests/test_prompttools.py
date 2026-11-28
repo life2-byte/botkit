@@ -71,6 +71,31 @@ def test_unknown_tool_and_bad_json_are_problems_not_calls():
     assert calls == [] and len(problems) == 2
 
 
+def test_bare_json_without_fence_and_loose_names():
+    text = json.dumps({"Write-File": {"arguments": {"path": "a.txt", "content": "1"}}})
+    clean, calls, problems = parse_reply(text, TOOLS)
+    assert clean == "" and not problems and calls[0]["function"]["name"] == "write_file"
+    for shape in ({"tool": "write_file", "args": {"path": "a", "content": "b"}},
+                  {"name": "WRITE_FILE", "parameters": {"path": "a", "content": "b"}}):
+        assert parse_reply("```json\n" + json.dumps(shape) + "\n```", TOOLS)[1][0]["function"]["name"] == "write_file"
+
+
+def test_wrong_or_missing_arguments_are_problems():
+    wrong = json.dumps({"Create-file": {"arguments": {"context": "<html>"}}})  # a real DeepSeek reply
+    _, calls, problems = parse_reply(wrong, TOOLS)
+    assert calls == [] and "valid tools" in problems[0]
+    _, calls, problems = parse_reply(json.dumps({"name": "write_file", "arguments": {"context": "x"}}), TOOLS)
+    assert calls == [] and "needs the arguments path, content" in problems[0]
+
+
+def test_wrong_json_reply_gets_a_correction_round_then_works():
+    wrong = json.dumps({"Create-file": {"arguments": {"context": "<html>"}}})
+    llm = fake_llm([wrong, block("write_file", path="a.html", content="<html>")], tool_mode="prompt")
+    out = llm.chat([{"role": "user", "content": "x"}], TOOLS)
+    assert out["tool_calls"][0]["function"]["name"] == "write_file" and len(llm.sent) == 2
+    assert "write_file(path, content)" in llm.sent[1]["messages"][-1]["content"]
+
+
 def test_to_plain_rewrites_tool_messages():
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "go"},
             {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "type": "function", "function": {
@@ -123,3 +148,39 @@ def test_agent_flag_reaches_llm_and_fallback_dict():
 def test_render_tools_lists_args():
     text = render_tools(TOOLS)
     assert "write_file" in text and "path (string, required)" in text
+
+
+def test_tool_prompt_user_puts_instructions_in_latest_user_message_only():
+    llm = fake_llm(["ok"], tool_mode="prompt", tool_prompt="user")
+    llm.chat([{"role": "system", "content": "SYS"}, {"role": "user", "content": "first"},
+              {"role": "assistant", "content": "a"}, {"role": "user", "content": "make a file"}], TOOLS)
+    m = llm.sent[0]["messages"]
+    assert m[0] == {"role": "system", "content": "SYS"} and "first" == m[1]["content"]
+    assert "write_file" in m[-1]["content"] and m[-1]["content"].endswith("make a file")
+
+
+def test_custom_template_and_example_in_default_text():
+    plain = to_plain([{"role": "user", "content": "x"}], TOOLS, "system", "MY RULES\n{tools}\nEG {example}")
+    assert plain[0]["content"].startswith("MY RULES") and "* write_file" in plain[0]["content"] and "EG ```tool" in plain[0]["content"]
+    default = render_tools(TOOLS)
+    assert '"name": "write_file", "arguments": {"path": "hello.txt", "content": "hi"}' in default
+    assert "{tools}" not in default and "{example}" not in default
+
+
+def test_bad_tool_prompt_rejected():
+    with pytest.raises(LLMError):
+        LLM("openai:x", api_key="k", tool_mode="prompt", tool_prompt="nope")
+
+
+def test_bare_prompt_is_only_system_rules_security(tmp_path):
+    a = Agent("openai:x", api_key="k", tools=True, skills=True, system="", rules=["R1"], bare_prompt=True, workdir=tmp_path)
+    text = a._system_prompt()
+    assert text.startswith("Rules from the app owner") and "R1" in text and "Security rules" in text
+    assert "Current date" not in text and "Your tools" not in text and "skills" not in text
+    b = Agent("openai:x", api_key="k", system="", workdir=tmp_path)  # empty system without bare: no blank start
+    assert b._system_prompt().startswith("Current date")
+
+
+def test_agent_passes_tool_prompt_options():
+    a = Agent("openai:x", api_key="k", tool_mode="prompt", tool_prompt="user", tool_prompt_text="T {tools}")
+    assert a.llm.tool_prompt == "user" and a.llm.tool_prompt_text == "T {tools}"
